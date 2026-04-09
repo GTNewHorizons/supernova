@@ -343,24 +343,6 @@ public abstract class MixinChunk implements SupernovaChunk {
         // no-op: Supernova handles all light propagation
     }
 
-    @Inject(method = "fillChunk", at = @At("RETURN"))
-    private void supernova$onFillChunk(byte[] data, int extractFlags, int chunkY, boolean forceUpdate, CallbackInfo ci) {
-        if (this.worldObj == null || !this.worldObj.isRemote) return;
-        final WorldLightManager iface = ((SupernovaWorld) this.worldObj).supernova$getLightManager();
-        if (iface == null) return;
-
-        ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, this.storageArrays, false);
-        ChunkLightHelper.importVanillaBlock(this.supernova$blockNibblesR, this.supernova$blockNibblesG, this.supernova$blockNibblesB, this.storageArrays);
-
-        iface.registerChunk((Chunk) (Object) this);
-
-        final Boolean[] emptySections = SupernovaEngine.getEmptySectionsForChunk((Chunk) (Object) this);
-        iface.queueChunkLight(this.xPosition, this.zPosition, (Chunk) (Object) this, emptySections);
-        iface.scheduleUpdate();
-
-        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, this.storageArrays);
-    }
-
     @Inject(method = "onChunkUnload", at = @At("HEAD"))
     private void supernova$onChunkUnload(CallbackInfo ci) {
         if (this.worldObj == null) return;

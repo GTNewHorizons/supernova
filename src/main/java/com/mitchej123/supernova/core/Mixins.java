@@ -14,6 +14,7 @@ public enum Mixins implements IMixins {
                     "early.engine.MixinWorld",
                     "early.engine.MixinWorldServer")
             .addClientMixins(
+                    "early.engine.MixinChunk_FillChunkClient",
                     "early.engine.MixinPlayerControllerMP"
             )
             .setPhase(Phase.EARLY)
