@@ -29,10 +29,10 @@ Blocks can provide dynamic colored emission via the `ColoredLightSource` interfa
 
 **Required:**
 * [GTNHLib](https://github.com/GTNewHorizons/GTNHLib)
-* [ChunkAPI](https://github.com/LegacyModdingMC/ChunkAPI) (requires [FalsePatternLib](https://github.com/FalsePattern/FalsePatternLib))
 * [Hodgepodge](https://github.com/GTNewHorizons/Hodgepodge) (>= 2.7.107)
 
 **Optional:**
+* [ChunkAPI](https://github.com/LegacyModdingMC/ChunkAPI) (requires [FalsePatternLib](https://github.com/FalsePattern/FalsePatternLib)) - required for RGB mode persistence; without it, Supernova forces scalar mode
 * [Angelica](https://github.com/GTNewHorizons/Angelica) (>= 2.1.6, RGB-aware rendering; falls back to vanilla tinting without it)
 * [EndlessIDs](https://github.com/GTMEGA/EndlessIDs)
 
