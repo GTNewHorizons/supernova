@@ -37,7 +37,10 @@ public abstract class MixinWorld implements SupernovaWorld {
     @Unique
     private boolean supernova$playerAction;
 
-    @Inject(method = "<init>*", at = @At("RETURN"))
+    @Inject(method = {
+        "<init>(Lnet/minecraft/world/storage/ISaveHandler;Ljava/lang/String;Lnet/minecraft/world/WorldProvider;Lnet/minecraft/world/WorldSettings;Lnet/minecraft/profiler/Profiler;)V",
+        "<init>(Lnet/minecraft/world/storage/ISaveHandler;Ljava/lang/String;Lnet/minecraft/world/WorldSettings;Lnet/minecraft/world/WorldProvider;Lnet/minecraft/profiler/Profiler;)V"
+    }, at = @At("RETURN"))
     private void supernova$onWorldInit(CallbackInfo ci) {
         this.supernova$ready = true;
     }
