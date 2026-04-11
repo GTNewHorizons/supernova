@@ -2,6 +2,7 @@ package com.mitchej123.supernova.light.engine;
 
 import com.mitchej123.supernova.Supernova;
 import com.mitchej123.supernova.api.ExtendedWorld;
+import com.mitchej123.supernova.compat.cubicchunks.CubicChunksHelper;
 import com.mitchej123.supernova.compat.endlessids.EndlessIDsCompat;
 import com.mitchej123.supernova.light.LightStats;
 import com.mitchej123.supernova.light.RenderUpdateQueue;
@@ -203,7 +204,7 @@ public abstract class SupernovaEngine {
                 this.setChunkInCache(cx, cz, chunk);
                 this.setEmptinessMapCache(cx, cz, this.getEmptinessMap(chunk));
                 if (!isTwoRadius) {
-                    this.setBlocksForChunkInCache(cx, cz, chunk.getBlockStorageArray());
+                    this.setBlocksForChunkInCache(cx, cz, CubicChunksHelper.getBlockStorageArrays(chunk));
                     this.setNibblesForChunkInCache(cx, cz, this.getNibblesOnChunk(chunk));
                     this.loadExtraNibblesToCache(cx, cz, chunk);
                 }
@@ -436,7 +437,7 @@ public abstract class SupernovaEngine {
     }
 
     public static Boolean[] getEmptySectionsForChunk(final Chunk chunk) {
-        final ExtendedBlockStorage[] sections = chunk.getBlockStorageArray();
+        final ExtendedBlockStorage[] sections = CubicChunksHelper.getBlockStorageArrays(chunk);
         final Boolean[] ret = new Boolean[sections.length];
         for (int i = 0; i < sections.length; ++i) {
             ret[i] = (sections[i] == null || sections[i].isEmpty()) ? Boolean.TRUE : Boolean.FALSE;
@@ -536,7 +537,7 @@ public abstract class SupernovaEngine {
         try {
             final SWMRNibbleArray[] nibbles = getFilledEmptyLight();
             this.setChunkInCache(chunkX, chunkZ, chunk);
-            this.setBlocksForChunkInCache(chunkX, chunkZ, chunk.getBlockStorageArray());
+            this.setBlocksForChunkInCache(chunkX, chunkZ, CubicChunksHelper.getBlockStorageArrays(chunk));
             this.setNibblesForChunkInCache(chunkX, chunkZ, nibbles);
             this.setupExtraLightNibbles(chunkX, chunkZ);
             this.setEmptinessMapCache(chunkX, chunkZ, this.getEmptinessMap(chunk));
@@ -574,7 +575,11 @@ public abstract class SupernovaEngine {
             this.prepareBatchedEdgeChecks(chunkX, chunkZ);
             final IntIterator it = sections.iterator();
             while (it.hasNext()) {
-                this.checkChunkEdge(chunkX, it.nextInt(), chunkZ);
+                final int sectionY = it.nextInt();
+                if (!this.isLightSectionInRange(sectionY)) {
+                    continue;
+                }
+                this.checkChunkEdge(chunkX, sectionY, chunkZ);
                 this.performLightDecrease();  // drain BFS per-section so later sections see earlier corrections
             }
             this.updateVisible();
@@ -584,6 +589,10 @@ public abstract class SupernovaEngine {
     }
 
     protected void prepareBatchedEdgeChecks(final int chunkX, final int chunkZ) {}
+
+    protected final boolean isLightSectionInRange(final int sectionY) {
+        return sectionY >= this.minLightSection && sectionY <= this.maxLightSection;
+    }
 
     /**
      * Process per-section emptiness changes.
@@ -686,6 +695,9 @@ public abstract class SupernovaEngine {
     }
 
     protected void checkChunkEdge(final int chunkX, final int chunkY, final int chunkZ) {
+        if (!this.isLightSectionInRange(chunkY)) {
+            return;
+        }
         final int currIdx = chunkX + 5 * chunkZ + (5 * 5) * chunkY + this.chunkSectionIndexOffset;
         final SWMRNibbleArray currNibble = this.nibbleCache[currIdx];
         if (currNibble == null) {

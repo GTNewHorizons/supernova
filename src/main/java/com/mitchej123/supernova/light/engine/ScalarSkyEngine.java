@@ -1,5 +1,6 @@
 package com.mitchej123.supernova.light.engine;
 
+import com.mitchej123.supernova.compat.cubicchunks.CubicChunksHelper;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.light.SupernovaChunk;
 import com.mitchej123.supernova.util.SnapshotChunkMap;
@@ -373,11 +374,11 @@ public class ScalarSkyEngine extends SupernovaEngine {
 
         final int chunkX = chunk.xPosition;
         final int chunkZ = chunk.zPosition;
-        final ExtendedBlockStorage[] sections = chunk.getBlockStorageArray();
+        final ExtendedBlockStorage[] sections = CubicChunksHelper.getBlockStorageArrays(chunk);
 
         int highestNonEmptySection = this.maxSection;
-        while (highestNonEmptySection >= this.minSection && (sections[highestNonEmptySection - this.minSection] == null || sections[highestNonEmptySection
-                - this.minSection].isEmpty())) {
+        ExtendedBlockStorage section = CubicChunksHelper.getBlockStorageArray(chunk, highestNonEmptySection);
+        while (highestNonEmptySection >= this.minSection && (section == null || section.isEmpty())) {
             this.checkNullSection(chunkX, highestNonEmptySection, chunkZ, false);
 
             for (final AxisDirection direction : ONLY_HORIZONTAL_DIRECTIONS) {
@@ -412,6 +413,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
             }
 
             --highestNonEmptySection;
+            section = CubicChunksHelper.getBlockStorageArray(chunk, highestNonEmptySection);
         }
 
         if (highestNonEmptySection >= this.minSection) {
@@ -450,6 +452,9 @@ public class ScalarSkyEngine extends SupernovaEngine {
         final int chunkX = chunk.xPosition;
         final int chunkZ = chunk.zPosition;
         for (int y = toSection; y >= fromSection; --y) {
+            if (!this.isLightSectionInRange(y)) {
+                continue;
+            }
             this.checkNullSection(chunkX, y, chunkZ, true);
         }
         super.checkChunkEdges(chunk, fromSection, toSection);

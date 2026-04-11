@@ -74,6 +74,9 @@ public final class LightQueue {
     }
 
     public synchronized void queueEdgeCheck(final int cx, final int cz, final int sectionY, final boolean isSky) {
+        if (!isLightSectionInRange(sectionY)) {
+            return;
+        }
         final long key = CoordinateUtils.getChunkKey(cx, cz);
         final ChunkTasks tasks = this.getOrCreate(key);
         if (isSky) {
@@ -112,6 +115,10 @@ public final class LightQueue {
             }
         }
         this.workAvailable.release(1);
+    }
+
+    private static boolean isLightSectionInRange(final int sectionY) {
+        return sectionY >= WorldUtil.getMinLightSection() && sectionY <= WorldUtil.getMaxLightSection();
     }
 
     /**

@@ -6,6 +6,7 @@ import com.mitchej123.supernova.config.BlockColorConfig;
 import com.mitchej123.supernova.config.BlockTranslucencyConfig;
 import com.mitchej123.supernova.config.DefaultColors;
 import com.mitchej123.supernova.config.DefaultTranslucency;
+import com.mitchej123.supernova.compat.cubicchunks.CubicChunksCompat;
 import com.mitchej123.supernova.core.SupernovaCore;
 import com.mitchej123.supernova.light.LightRegistryDiagnostics;
 import com.mitchej123.supernova.light.engine.FaceOcclusion;
@@ -28,6 +29,7 @@ public class CommonProxy {
     public void preInit(FMLPreInitializationEvent event) {
         Supernova.LOG.info("Supernova " + Tags.VERSION + " loading");
         this.configDir = event.getModConfigurationDirectory();
+        CubicChunksCompat.init();
     }
 
     public void init(FMLInitializationEvent event) {

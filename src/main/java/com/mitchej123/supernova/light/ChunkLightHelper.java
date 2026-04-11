@@ -1,5 +1,6 @@
 package com.mitchej123.supernova.light;
 
+import com.mitchej123.supernova.compat.cubicchunks.CubicChunksHelper;
 import com.mitchej123.supernova.util.WorldUtil;
 import net.minecraft.world.chunk.NibbleArray;
 import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
@@ -14,7 +15,7 @@ public final class ChunkLightHelper {
         final int minLight = WorldUtil.getMinLightSection();
         for (int i = 0; i < blockNibblesR.length; ++i) {
             final int sectionY = i + minLight;
-            if (sectionY < 0 || sectionY > 15 || storageArrays[sectionY] == null) {
+            if (sectionY < 0 || sectionY >= storageArrays.length || storageArrays[sectionY] == null) {
                 continue;
             }
             if (!blockNibblesR[i].isNullNibbleVisible()) {
@@ -29,7 +30,7 @@ public final class ChunkLightHelper {
         final int minLight = WorldUtil.getMinLightSection();
         for (int i = 0; i < skyR.length; ++i) {
             final int sectionY = i + minLight;
-            if (sectionY < 0 || sectionY > 15 || storageArrays[sectionY] == null) continue;
+            if (sectionY < 0 || sectionY >= storageArrays.length || storageArrays[sectionY] == null) continue;
             final NibbleArray vanillaSky = storageArrays[sectionY].getSkylightArray();
             if (vanillaSky == null) continue;
             if (onlyWhereNull && !skyR[i].isNullNibbleVisible()) continue;
@@ -44,7 +45,7 @@ public final class ChunkLightHelper {
         final int minLight = WorldUtil.getMinLightSection();
         for (int i = 0; i < blockR.length; ++i) {
             final int sectionY = i + minLight;
-            if (sectionY < 0 || sectionY > 15 || storageArrays[sectionY] == null) continue;
+            if (sectionY < 0 || sectionY >= storageArrays.length || storageArrays[sectionY] == null) continue;
             final NibbleArray vanillaBlock = storageArrays[sectionY].getBlocklightArray();
             if (vanillaBlock == null) continue;
             blockR[i] = SWMRNibbleArray.fromVanilla(vanillaBlock);
@@ -60,7 +61,7 @@ public final class ChunkLightHelper {
             if (skyNib == null) continue;
 
             final int sectionY = i + minLight;
-            if (sectionY < 0 || sectionY > 15 || storageArrays[sectionY] == null) continue;
+            if (sectionY < 0 || sectionY >= storageArrays.length || storageArrays[sectionY] == null) continue;
 
             final NibbleArray vanilla = storageArrays[sectionY].getSkylightArray();
             if (vanilla == null) continue;
@@ -82,7 +83,7 @@ public final class ChunkLightHelper {
             if (rNib == null) continue;
 
             final int sectionY = i + minLight;
-            if (sectionY < 0 || sectionY > 15 || storageArrays[sectionY] == null) continue;
+            if (sectionY < 0 || sectionY >= storageArrays.length || storageArrays[sectionY] == null) continue;
 
             final NibbleArray vanilla = storageArrays[sectionY].getBlocklightArray();
             if (vanilla == null) continue;

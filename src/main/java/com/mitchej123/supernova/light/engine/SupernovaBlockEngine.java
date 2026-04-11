@@ -4,6 +4,7 @@ import com.mitchej123.supernova.api.ColoredLightSource;
 import com.mitchej123.supernova.api.LightColorRegistry;
 import com.mitchej123.supernova.api.PackedColorLight;
 import com.mitchej123.supernova.api.TranslucencyRegistry;
+import com.mitchej123.supernova.compat.cubicchunks.CubicChunksHelper;
 import com.mitchej123.supernova.light.LightStats;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.light.SupernovaChunk;
@@ -219,11 +220,10 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
     protected void lightChunk(final Chunk chunk, final boolean needsEdgeChecks) {
         final int offX = chunk.xPosition << 4;
         final int offZ = chunk.zPosition << 4;
-        final ExtendedBlockStorage[] sections = chunk.getBlockStorageArray();
         int emitterCount = 0;
 
         for (int sectionY = this.minSection; sectionY <= this.maxSection; ++sectionY) {
-            final ExtendedBlockStorage section = sections[sectionY - this.minSection];
+            final ExtendedBlockStorage section = CubicChunksHelper.getBlockStorageArray(chunk, sectionY);
             if (section == null || section.isEmpty()) {
                 continue;
             }

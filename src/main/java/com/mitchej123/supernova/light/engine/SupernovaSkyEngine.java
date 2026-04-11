@@ -4,6 +4,7 @@ import com.mitchej123.supernova.api.ColoredTranslucency;
 import com.mitchej123.supernova.api.PackedColorLight;
 import com.mitchej123.supernova.api.PositionalColoredTranslucency;
 import com.mitchej123.supernova.api.TranslucencyRegistry;
+import com.mitchej123.supernova.compat.cubicchunks.CubicChunksHelper;
 import com.mitchej123.supernova.light.LightStats;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.light.SupernovaChunk;
@@ -272,6 +273,9 @@ public class SupernovaSkyEngine extends SupernovaRGBEngine {
         final int chunkX = chunk.xPosition;
         final int chunkZ = chunk.zPosition;
         for (int y = toSection; y >= fromSection; --y) {
+            if (!this.isLightSectionInRange(y)) {
+                continue;
+            }
             this.checkNullSection(chunkX, y, chunkZ, true);
         }
         super.checkChunkEdges(chunk, fromSection, toSection);
@@ -510,11 +514,10 @@ public class SupernovaSkyEngine extends SupernovaRGBEngine {
 
         final int chunkX = chunk.xPosition;
         final int chunkZ = chunk.zPosition;
-        final ExtendedBlockStorage[] sections = chunk.getBlockStorageArray();
 
         int highestNonEmptySection = this.maxSection;
-        while (highestNonEmptySection >= this.minSection && (sections[highestNonEmptySection - this.minSection] == null || sections[highestNonEmptySection
-                - this.minSection].isEmpty())) {
+        ExtendedBlockStorage section = CubicChunksHelper.getBlockStorageArray(chunk, highestNonEmptySection);
+        while (highestNonEmptySection >= this.minSection && (section == null || section.isEmpty())) {
             this.checkNullSection(chunkX, highestNonEmptySection, chunkZ, false);
 
             for (final AxisDirection direction : ONLY_HORIZONTAL_DIRECTIONS) {
@@ -549,6 +552,7 @@ public class SupernovaSkyEngine extends SupernovaRGBEngine {
             }
 
             --highestNonEmptySection;
+            section = CubicChunksHelper.getBlockStorageArray(chunk, highestNonEmptySection);
         }
 
         if (highestNonEmptySection >= this.minSection) {

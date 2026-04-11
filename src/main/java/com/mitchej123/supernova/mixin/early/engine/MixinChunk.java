@@ -1,5 +1,6 @@
 package com.mitchej123.supernova.mixin.early.engine;
 
+import com.mitchej123.supernova.compat.cubicchunks.CubicChunksHelper;
 import com.mitchej123.supernova.config.SupernovaConfig;
 import com.mitchej123.supernova.core.SupernovaCore;
 import com.mitchej123.supernova.light.ChunkLightHelper;
@@ -38,7 +39,6 @@ public abstract class MixinChunk implements SupernovaChunk {
     @Shadow public boolean isTerrainPopulated;
     @Shadow public boolean isLightPopulated;
     @Shadow public static boolean isLit;
-    @Shadow private ExtendedBlockStorage[] storageArrays;
 
     @Shadow
     public abstract int getTopFilledSegment();
@@ -85,11 +85,12 @@ public abstract class MixinChunk implements SupernovaChunk {
     // Import vanilla light data and trigger block engine for chunks without saved RGB data.
     @Inject(method = "onChunkLoad", at = @At("HEAD"))
     private void supernova$onChunkLoad(CallbackInfo ci) {
+        ExtendedBlockStorage[] storageArrays = CubicChunksHelper.getBlockStorageArrays((Chunk) (Object)this);
         if (!SupernovaCore.CHUNKAPI_PRESENT && this.isLightPopulated) {
-            ChunkLightHelper.importVanillaBlock(this.supernova$blockNibblesR, null, null, this.storageArrays);
+            ChunkLightHelper.importVanillaBlock(this.supernova$blockNibblesR, null, null, storageArrays);
         }
 
-        final boolean hasBlockData = ChunkLightHelper.hasSavedBlockData(this.supernova$blockNibblesR, this.storageArrays);
+        final boolean hasBlockData = ChunkLightHelper.hasSavedBlockData(this.supernova$blockNibblesR, storageArrays);
 
         if (this.worldObj != null) {
             final WorldLightManager iface = ((SupernovaWorld) this.worldObj).supernova$getLightManager();
@@ -99,11 +100,11 @@ public abstract class MixinChunk implements SupernovaChunk {
 
                 if (hasBlockData) {
                     // Chunk has saved Supernova data -- import vanilla sky light where missing and mark ready.
-                    ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, this.storageArrays, true);
+                    ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, storageArrays, true);
                     ((SupernovaChunk) this).setLightReady(true);
                 } else if (!this.worldObj.isRemote) {
                     // Import vanilla sky so game logic has correct values during BFS backlog
-                    ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, this.storageArrays, false);
+                    ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, storageArrays, false);
                     final Boolean[] emptySections = SupernovaEngine.getEmptySectionsForChunk((Chunk) (Object) this);
                     iface.queueChunkLight(this.xPosition, this.zPosition, (Chunk) (Object) this, emptySections);
                     iface.scheduleUpdate();
@@ -111,15 +112,16 @@ public abstract class MixinChunk implements SupernovaChunk {
             }
         }
 
-        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, this.storageArrays);
+        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, storageArrays);
     }
 
     @Override
     public void syncLightToVanilla() {
-        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, this.storageArrays);
+        ExtendedBlockStorage[] storageArrays = CubicChunksHelper.getBlockStorageArrays((Chunk) (Object)this);
+        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, storageArrays);
         ChunkLightHelper.syncBlockToVanilla(
             this.supernova$blockNibblesR, this.supernova$blockNibblesG, this.supernova$blockNibblesB,
-            this.storageArrays);
+            storageArrays);
     }
 
     @Override
@@ -263,9 +265,10 @@ public abstract class MixinChunk implements SupernovaChunk {
      */
     @Unique
     private void supernova$fillVanillaSkyForColumn(final int x, final int z, final int topSegment) {
+        ExtendedBlockStorage[] storageArrays = CubicChunksHelper.getBlockStorageArrays((Chunk) (Object)this);
         int skyLevel = 15;
         for (int y = topSegment + 15; y >= 0; --y) {
-            final ExtendedBlockStorage section = this.storageArrays[y >> 4];
+            final ExtendedBlockStorage section = storageArrays[y >> 4];
             if (section == null) {
                 if (skyLevel != 15) {
                     skyLevel = Math.max(0, skyLevel - 1);
@@ -349,8 +352,9 @@ public abstract class MixinChunk implements SupernovaChunk {
         final WorldLightManager iface = ((SupernovaWorld) this.worldObj).supernova$getLightManager();
         if (iface == null) return;
 
-        ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, this.storageArrays, false);
-        ChunkLightHelper.importVanillaBlock(this.supernova$blockNibblesR, this.supernova$blockNibblesG, this.supernova$blockNibblesB, this.storageArrays);
+        ExtendedBlockStorage[] storageArrays = CubicChunksHelper.getBlockStorageArrays((Chunk) (Object)this);
+        ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, storageArrays, false);
+        ChunkLightHelper.importVanillaBlock(this.supernova$blockNibblesR, this.supernova$blockNibblesG, this.supernova$blockNibblesB, storageArrays);
 
         iface.registerChunk((Chunk) (Object) this);
 
@@ -358,7 +362,7 @@ public abstract class MixinChunk implements SupernovaChunk {
         iface.queueChunkLight(this.xPosition, this.zPosition, (Chunk) (Object) this, emptySections);
         iface.scheduleUpdate();
 
-        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, this.storageArrays);
+        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, storageArrays);
     }
 
     @Inject(method = "onChunkUnload", at = @At("HEAD"))

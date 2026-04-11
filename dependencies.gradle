@@ -36,6 +36,7 @@
 dependencies {
     api("com.github.GTNewHorizons:GTNHLib:0.9.36:dev")
     compileOnly("com.falsepattern:chunkapi-mc1.7.10:0.8.1:dev")
+    compileOnly("com.cardinalstar.cubicchunks:CubicChunks1710:9.9.9:dev")
     devOnlyNonPublishable("com.falsepattern:chunkapi-mc1.7.10:0.8.1:dev")
     compileOnly("com.github.GTNewHorizons:Angelica:2.1.6:dev") { transitive = false }
     compileOnly("com.falsepattern:endlessids-mc1.7.10:1.7.1:dev") { transitive = false }

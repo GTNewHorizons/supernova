@@ -1,5 +1,6 @@
 package com.mitchej123.supernova.light.engine;
 
+import com.mitchej123.supernova.compat.cubicchunks.CubicChunksHelper;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.light.SupernovaChunk;
 import com.mitchej123.supernova.util.SnapshotChunkMap;
@@ -173,10 +174,9 @@ public class ScalarBlockEngine extends SupernovaEngine {
     protected void lightChunk(final Chunk chunk, final boolean needsEdgeChecks) {
         final int offX = chunk.xPosition << 4;
         final int offZ = chunk.zPosition << 4;
-        final ExtendedBlockStorage[] sections = chunk.getBlockStorageArray();
 
         for (int sectionY = this.minSection; sectionY <= this.maxSection; ++sectionY) {
-            final ExtendedBlockStorage section = sections[sectionY - this.minSection];
+            final ExtendedBlockStorage section = CubicChunksHelper.getBlockStorageArray(chunk, sectionY);
             if (section == null || section.isEmpty()) {
                 continue;
             }
