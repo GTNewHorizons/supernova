@@ -41,7 +41,7 @@ Blocks can provide dynamic colored emission via the `ColoredLightSource` interfa
 Supernova replaces the vanilla lighting engine, and does so in such a fashion that it's incompatible with other lighting engines and mixins.
 
 * ArchaicFix - Phosphor - Phosphor must be disabled.
-* CoreTweaks - fixHeightmapRange/light_fix_stare - Config/Mixin must be disabled.
+* CoreTweaks - fixHeightmapRange/lightFixStare - Config/Mixin must be disabled.
 * Lumi/RPLE - Incompatible. 
 
 ## Configuration
