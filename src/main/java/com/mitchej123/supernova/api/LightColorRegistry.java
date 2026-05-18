@@ -1,6 +1,7 @@
 package com.mitchej123.supernova.api;
 
 import com.mitchej123.supernova.Supernova;
+import com.mitchej123.supernova.config.SupernovaConfig;
 import cpw.mods.fml.common.registry.GameData;
 import net.minecraft.block.Block;
 import net.minecraft.world.IBlockAccess;
@@ -109,7 +110,7 @@ public final class LightColorRegistry {
         } else if (meta >= entry.length) {
             entry = Arrays.copyOf(entry, meta + 1);
         }
-        entry[meta] = PackedColorLight.pack(r, g, b) + 1; // +1 so 0 = unregistered
+        entry[meta] = scaleToVanillaLight(PackedColorLight.pack(r, g, b), block.getLightValue()) + 1; // +1 so 0 = unregistered
         REGISTRY_BY_ID[id] = entry;
         markEntry(block);
     }
@@ -125,7 +126,7 @@ public final class LightColorRegistry {
     public static void register(Block block, int r, int g, int b) {
         final int id = Block.getIdFromBlock(block);
         ensureCapacity(id);
-        REGISTRY_BY_ID[id] = new int[] { PackedColorLight.pack(r, g, b) + 1 };
+        REGISTRY_BY_ID[id] = new int[] { scaleToVanillaLight(PackedColorLight.pack(r, g, b), block.getLightValue()) + 1 };
         markEntry(block);
     }
 
@@ -368,6 +369,25 @@ public final class LightColorRegistry {
         final int b = (eclValue >>> 15) & 0xF;
         if ((r | g | b) == 0) return 0;
         return PackedColorLight.pack(r, g, b);
+    }
+
+    /**
+     * Scale a packed RGB so its max channel is at least {@code vanillaLight}, preserving channel ratios.
+     */
+    static int scaleToVanillaLight(int packed, int vanillaLight) {
+        if (!SupernovaConfig.scaleEmissionToVanillaLight) return packed;
+        final int v = vanillaLight & 0xF;
+        if (v <= 0) return packed;
+        final int r = PackedColorLight.red(packed);
+        final int g = PackedColorLight.green(packed);
+        final int b = PackedColorLight.blue(packed);
+        final int max = Math.max(r, Math.max(g, b));
+        if (max <= 0 || max >= v) return packed;
+        final int half = max >> 1;
+        final int nr = Math.min(15, (r * v + half) / max);
+        final int ng = Math.min(15, (g * v + half) / max);
+        final int nb = Math.min(15, (b * v + half) / max);
+        return PackedColorLight.pack(nr, ng, nb);
     }
 
     private static void markEntry(Block block) {
