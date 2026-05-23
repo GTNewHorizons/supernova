@@ -149,6 +149,12 @@ public final class LightColorRegistry {
             return ((ColoredLightSource) block).getColoredLightEmission(meta);
         }
 
+        // Tile-light registry: emission published from a tile entity via TileLightStore.
+        if (TileLightRegistry.contains(block)) {
+            final int dim = TileLightStore.dimensionOf(world);
+            return dim == Integer.MIN_VALUE ? 0 : TileLightStore.get(dim, x, y, z);
+        }
+
         // EasyColoredLights auto-detect
         final int rawLight = block.getLightValue(world, x, y, z);
         if (rawLight > 15) {
@@ -272,6 +278,12 @@ public final class LightColorRegistry {
 
             // PositionalColoredLightSource -- uncacheable (needs world + pos)
             if (block instanceof PositionalColoredLightSource) {
+                EMISSION_CACHE[bid] = UNCACHEABLE;
+                continue;
+            }
+
+            // TileLightRegistry -- uncacheable (sourced from TileLightStore at position)
+            if (TileLightRegistry.contains(bid)) {
                 EMISSION_CACHE[bid] = UNCACHEABLE;
                 continue;
             }

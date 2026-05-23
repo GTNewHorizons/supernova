@@ -7,10 +7,15 @@ import javax.annotation.Nonnull;
 
 public enum TargetedMod implements ITargetMod {
 
-    ANGELICA("com.gtnewhorizons.angelica.loading.AngelicaTweaker", "angelica");
+    ANGELICA("com.gtnewhorizons.angelica.loading.AngelicaTweaker", "angelica"),
+    FMP("codechicken.multipart.minecraft.MinecraftMultipartMod");
 
     private final TargetModBuilder builder;
 
+
+    TargetedMod(String targetClass) {
+        this.builder = new TargetModBuilder().setTargetClass(targetClass);
+    }
     TargetedMod(String coreModClass, String modId) {
         this.builder = new TargetModBuilder().setCoreModClass(coreModClass).setModId(modId);
     }

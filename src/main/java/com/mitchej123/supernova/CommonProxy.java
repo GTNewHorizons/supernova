@@ -1,6 +1,7 @@
 package com.mitchej123.supernova;
 
 import com.mitchej123.supernova.api.LightColorRegistry;
+import com.mitchej123.supernova.api.TileLightStore;
 import com.mitchej123.supernova.api.TranslucencyRegistry;
 import com.mitchej123.supernova.config.BlockColorConfig;
 import com.mitchej123.supernova.config.BlockTranslucencyConfig;
@@ -43,6 +44,7 @@ public class CommonProxy {
     @SubscribeEvent
     public void onWorldUnload(WorldEvent.Unload event) {
         ((SupernovaWorld) event.world).supernova$shutdown();
+        TileLightStore.clearDim(event.world.provider.dimensionId);
     }
 
     public void postInit(FMLPostInitializationEvent event) {

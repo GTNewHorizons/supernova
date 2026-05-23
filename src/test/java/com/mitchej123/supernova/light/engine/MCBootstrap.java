@@ -5,6 +5,8 @@ import net.minecraft.block.Block;
 import net.minecraft.block.material.Material;
 import net.minecraft.util.RegistryNamespacedDefaultedByKey;
 import net.minecraft.world.World;
+import net.minecraft.world.WorldProvider;
+import net.minecraft.world.WorldProviderSurface;
 import net.minecraft.world.WorldServer;
 import sun.misc.Unsafe;
 
@@ -75,6 +77,9 @@ public final class MCBootstrap {
         try {
             World world = (World) unsafe.allocateInstance(WorldServer.class);
             putBoolean(unsafe, world, World.class, "isRemote", false);
+            WorldProvider provider = (WorldProvider) unsafe.allocateInstance(WorldProviderSurface.class);
+            putInt(unsafe, provider, WorldProvider.class, "dimensionId", 0);
+            putField(unsafe, world, World.class, "provider", provider);
             return world;
         } catch (InstantiationException e) {
             throw new RuntimeException("Failed to create stub World", e);

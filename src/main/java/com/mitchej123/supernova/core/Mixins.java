@@ -31,6 +31,14 @@ public enum Mixins implements IMixins {
             .addClientMixins("early.rendering.MixinRenderManager")
             .setApplyIf(() -> !SupernovaConfig.isScalarMode())
             .setPhase(Phase.EARLY)
+    ),
+
+    FORGE_MULTIPART(new MixinBuilder("Forge Multipart tile-light bridge")
+            .addCommonMixins(
+                    "early.fmp.MixinTileMultipart",
+                    "early.fmp.MixinBlockMultipart")
+            .addRequiredMod(TargetedMod.FMP)
+            .setPhase(Phase.EARLY)
     );
 
     private final MixinBuilder builder;
