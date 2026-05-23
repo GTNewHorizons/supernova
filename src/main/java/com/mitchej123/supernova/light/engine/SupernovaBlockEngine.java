@@ -3,6 +3,8 @@ package com.mitchej123.supernova.light.engine;
 import com.mitchej123.supernova.api.ColoredLightSource;
 import com.mitchej123.supernova.api.LightColorRegistry;
 import com.mitchej123.supernova.api.PackedColorLight;
+import com.mitchej123.supernova.api.PositionalColoredLightSource;
+import com.mitchej123.supernova.api.TileLightRegistry;
 import com.mitchej123.supernova.api.TranslucencyRegistry;
 import com.mitchej123.supernova.light.LightStats;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
@@ -24,7 +26,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
 
     public SupernovaBlockEngine(final World world, final SnapshotChunkMap chunkMap) {
         super(false, world);
-        this.safeBlockAccess = new SafeBlockAccess(chunkMap);
+        this.safeBlockAccess = new SafeBlockAccess(chunkMap, world.provider.dimensionId);
     }
 
     @Override
@@ -243,14 +245,21 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                 final Block block = this.getBlockFast(sectionIdx, lx, ly, lz);
                 // Use non-positional getLightValue() -- during lightChunk we must not call
                 // World.getBlock() as it can trigger recursive chunk loading/generation.
-                if (block.getLightValue() <= 0 && !LightColorRegistry.hasExplicitEntry(block)) {
+                // Tile-driven emitters (PositionalColoredLightSource or TileLightRegistry) carry
+                // emission via tile state, so they must be probed even when the static lightValue
+                // field reads zero.
+                final boolean tileDriven = block instanceof PositionalColoredLightSource || TileLightRegistry.contains(block);
+                if (!tileDriven && block.getLightValue() <= 0 && !LightColorRegistry.hasExplicitEntry(block)) {
                     continue;
                 }
 
                 final int meta = section.getExtBlockMetadata(lx, ly, lz);
 
                 // Use world-safe variant to avoid recursive chunk loading during generation.
-                final int emittedRGB = LightColorRegistry.getPackedEmissionNoWorld(block, meta);
+                // safeBlockAccess never triggers loading, so positional probes are safe here.
+                final int emittedRGB = tileDriven
+                        ? LightColorRegistry.getPackedEmission(this.safeBlockAccess, block, meta, worldX, worldY, worldZ)
+                        : LightColorRegistry.getPackedEmissionNoWorld(block, meta);
                 if (emittedRGB == 0) {
                     continue;
                 }
@@ -648,7 +657,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
 
                 // Fast path: field read avoids World.getBlock() for non-emitting blocks
                 final int emittedRGB;
-                if (block.getLightValue() <= 0 && !(block instanceof ColoredLightSource) && !LightColorRegistry.hasExplicitEntry(block)) {
+                if (block.getLightValue() <= 0 && !(block instanceof ColoredLightSource) && !LightColorRegistry.hasExplicitEntry(block) && !TileLightRegistry.contains(block)) {
                     emittedRGB = 0;
                 } else {
                     emittedRGB = LightColorRegistry.getPackedEmission(this.safeBlockAccess, block, destMeta, offX, offY, offZ);

@@ -1,5 +1,6 @@
 package com.mitchej123.supernova.light.engine;
 
+import com.mitchej123.supernova.api.DimensionedBlockAccess;
 import com.mitchej123.supernova.util.SnapshotChunkMap;
 import net.minecraft.block.Block;
 import net.minecraft.init.Blocks;
@@ -15,12 +16,19 @@ import net.minecraftforge.common.util.ForgeDirection;
  * <p>
  * Any access to an unloaded chunk returns air/0/null -- no chunk loading is triggered.
  */
-public final class SafeBlockAccess implements IBlockAccess {
+public final class SafeBlockAccess implements IBlockAccess, DimensionedBlockAccess {
 
     private final SnapshotChunkMap chunkMap;
+    private final int dimensionId;
 
-    public SafeBlockAccess(final SnapshotChunkMap chunkMap) {
+    public SafeBlockAccess(final SnapshotChunkMap chunkMap, final int dimensionId) {
         this.chunkMap = chunkMap;
+        this.dimensionId = dimensionId;
+    }
+
+    @Override
+    public int getDimensionId() {
+        return this.dimensionId;
     }
 
     private Chunk getChunk(final int cx, final int cz) {

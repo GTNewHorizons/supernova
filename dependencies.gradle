@@ -40,12 +40,14 @@ dependencies {
     compileOnly("com.github.GTNewHorizons:Angelica:2.1.6:dev") { transitive = false }
     compileOnly("com.falsepattern:endlessids-mc1.7.10:1.7.1:dev") { transitive = false }
     compileOnly("mega:fluidlogged-mc1.7.10:0.1.2")  { transitive = false }
+    compileOnly('com.github.GTNewHorizons:ForgeMultipart:1.7.10:dev') { transitive = false }
 
     devOnlyNonPublishable('com.github.GTNewHorizons:NotEnoughItems:2.8.35-GTNH:dev')
     devOnlyNonPublishable('com.github.GTNewHorizons:CodeChickenCore:1.4.7:dev')
     devOnlyNonPublishable('com.github.GTNewHorizons:ProjectRed:4.12.26-GTNH:dev')
     devOnlyNonPublishable('com.github.GTNewHorizons:Angelica:2.1.6:dev')
     devOnlyNonPublishable('com.github.GTNewHorizons:Hodgepodge:2.7.109:dev')
+    devOnlyNonPublishable('com.github.GTNewHorizons:ForgeMultipart:1.7.10:dev')
 
     testImplementation("com.falsepattern:chunkapi-mc1.7.10:0.8.1:dev")
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
