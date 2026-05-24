@@ -381,7 +381,7 @@ public final class LightColorRegistry {
         final int r = PackedColorLight.red(packed);
         final int g = PackedColorLight.green(packed);
         final int b = PackedColorLight.blue(packed);
-        final int max = Math.max(r, Math.max(g, b));
+        final int max = PackedColorLight.maxComponent(packed);
         if (max <= 0 || max >= v) return packed;
         final int half = max >> 1;
         final int nr = Math.min(15, (r * v + half) / max);
