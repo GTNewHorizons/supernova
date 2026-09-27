@@ -39,6 +39,8 @@ public final class LightColorRegistry {
                 return type.getMethod("getLightValue", IBlockAccess.class, int.class, int.class, int.class).getDeclaringClass() != Block.class;
             } catch (final NoSuchMethodException e) {
                 return false;
+            } catch (final LinkageError e) {
+                return true;
             }
         }
     };
