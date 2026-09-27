@@ -5,8 +5,9 @@ package com.mitchej123.supernova.api;
  */
 public interface ExtendedChunk {
 
-    /**
-     * Returns {@code true} if initial light propagation has completed for this chunk. Light values are unreliable until this returns {@code true}.
-     */
+    /** Returns true when this chunk's lighting is complete. */
     boolean isLightReady();
+
+    /** Returns true when neighbors can seed from this chunk, even if edge checks remain. */
+    boolean isLightUsable();
 }

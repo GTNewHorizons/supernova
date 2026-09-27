@@ -26,6 +26,20 @@ public final class ColorRegistrationHelper {
     }
 
     /**
+     * Register a color for one meta of a block.
+     *
+     * @return 1 if registered, 0 if block not found
+     */
+    public static int registerBlock(String modId, String name, int meta, int packedColor) {
+        Block block = GameRegistry.findBlock(modId, name);
+        if (block != null) {
+            LightColorRegistry.register(block, meta, packedColor);
+            return 1;
+        }
+        return 0;
+    }
+
+    /**
      * Register per-meta colors from a packed int array.
      *
      * @return number of metas registered, or 0 if block not found
@@ -47,14 +61,7 @@ public final class ColorRegistrationHelper {
      * @return 16 if registered, 0 if block not found
      */
     public static int registerDyed(String modId, String name, int[] packedPalette) {
-        Block block = GameRegistry.findBlock(modId, name);
-        if (block != null) {
-            for (int meta = 0; meta < 16; meta++) {
-                LightColorRegistry.register(block, meta, packedPalette[meta]);
-            }
-            return 16;
-        }
-        return 0;
+        return registerPerMeta(modId, name, packedPalette);
     }
 
     /**
@@ -110,14 +117,7 @@ public final class ColorRegistrationHelper {
      * @return 16 if registered, 0 if block not found
      */
     public static int registerDyed(String modId, String name, int[][] palette) {
-        Block block = GameRegistry.findBlock(modId, name);
-        if (block != null) {
-            for (int meta = 0; meta < 16; meta++) {
-                LightColorRegistry.register(block, meta, palette[meta][0], palette[meta][1], palette[meta][2]);
-            }
-            return 16;
-        }
-        return 0;
+        return registerPerMeta(modId, name, palette);
     }
 
     /**

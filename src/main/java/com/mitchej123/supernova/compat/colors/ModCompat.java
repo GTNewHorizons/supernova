@@ -35,6 +35,7 @@ public enum ModCompat {
             "ThermalExpansion",
             "ThermalFoundation",
             "IC2",
+            "EnderIO",
             "appliedenergistics2",
             "DraconicEvolution",
             "Ztones",

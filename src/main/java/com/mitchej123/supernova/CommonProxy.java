@@ -1,14 +1,12 @@
 package com.mitchej123.supernova;
 
-import com.mitchej123.supernova.api.LightColorRegistry;
-import com.mitchej123.supernova.api.TranslucencyRegistry;
 import com.mitchej123.supernova.config.BlockColorConfig;
 import com.mitchej123.supernova.config.BlockTranslucencyConfig;
 import com.mitchej123.supernova.config.DefaultColors;
 import com.mitchej123.supernova.config.DefaultTranslucency;
 import com.mitchej123.supernova.core.SupernovaCore;
+import com.mitchej123.supernova.light.LightRegistries;
 import com.mitchej123.supernova.light.LightRegistryDiagnostics;
-import com.mitchej123.supernova.light.engine.FaceOcclusion;
 import com.mitchej123.supernova.storage.SupernovaDataManager;
 import com.mitchej123.supernova.storage.SupernovaSkyDataManager;
 import com.mitchej123.supernova.world.SupernovaWorld;
@@ -47,11 +45,9 @@ public class CommonProxy {
 
     public void postInit(FMLPostInitializationEvent event) {
         DefaultColors.registerModded();
-        LightRegistryDiagnostics.dumpUnregistered(this.configDir);
-        FaceOcclusion.registerDefaults();
-        TranslucencyRegistry.buildCache();
-        LightColorRegistry.buildCache();
         BlockColorConfig.load(this.configDir);
         BlockTranslucencyConfig.load(this.configDir);
+        LightRegistryDiagnostics.dumpUnregistered(this.configDir);
+        LightRegistries.rebuildAll();
     }
 }

@@ -89,7 +89,7 @@ public final class NetherliciousColors {
             }
         }
 
-        // Per-meta: NetherCrystal -- 5 colors × 2 sets (metas 0-4, 5-9), dim
+        // Per-meta: NetherCrystal -- 5 colors x 2 sets (metas 0-4, 5-9), dim
         Block netherCrystal = GameRegistry.findBlock(MOD, "NetherCrystal");
         if (netherCrystal != null) {
             int[] crystalColors = { LightColors.dim(LightColors.DYE_BLUE), LightColors.dim(LightColors.DYE_GREEN), LightColors.dim(LightColors.DYE_MAGENTA), LightColors.dim(LightColors.DYE_WHITE), LightColors.dim(LightColors.DYE_YELLOW) };

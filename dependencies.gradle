@@ -34,20 +34,30 @@
  * For more details, see https://docs.gradle.org/8.0.1/userguide/java_library_plugin.html#sec:java_library_configurations_graph
  */
 dependencies {
-    api("com.github.GTNewHorizons:GTNHLib:0.9.36:dev")
-    compileOnly("com.falsepattern:chunkapi-mc1.7.10:0.8.1:dev")
-    devOnlyNonPublishable("com.falsepattern:chunkapi-mc1.7.10:0.8.1:dev")
-    compileOnly("com.github.GTNewHorizons:Angelica:2.1.6:dev") { transitive = false }
+    api("com.github.GTNewHorizons:GTNHLib:0.11.41:dev")
+    compileOnly("com.falsepattern:chunkapi-mc1.7.10:0.8.2:dev")
+    devOnlyNonPublishable("com.falsepattern:chunkapi-mc1.7.10:0.8.2:dev")
+    compileOnly("com.github.GTNewHorizons:Angelica:2.1.61:dev") { transitive = false }
     compileOnly("com.falsepattern:endlessids-mc1.7.10:1.7.1:dev") { transitive = false }
     compileOnly("mega:fluidlogged-mc1.7.10:0.1.2")  { transitive = false }
 
-    devOnlyNonPublishable('com.github.GTNewHorizons:NotEnoughItems:2.8.35-GTNH:dev')
-    devOnlyNonPublishable('com.github.GTNewHorizons:CodeChickenCore:1.4.7:dev')
-    devOnlyNonPublishable('com.github.GTNewHorizons:ProjectRed:4.12.26-GTNH:dev')
-    devOnlyNonPublishable('com.github.GTNewHorizons:Angelica:2.1.6:dev')
-    devOnlyNonPublishable('com.github.GTNewHorizons:Hodgepodge:2.7.109:dev')
+    runtimeOnlyNonPublishable("ganymedes01.etfuturum:Et-Futurum-Requiem:2.6.58-GTNH:dev")
+    devOnlyNonPublishable('com.github.GTNewHorizons:Draconic-Evolution:1.5.33-GTNH:dev')
 
-    testImplementation("com.falsepattern:chunkapi-mc1.7.10:0.8.1:dev")
+    devOnlyNonPublishable('com.github.GTNewHorizons:NotEnoughItems:2.8.117-GTNH:dev')
+    devOnlyNonPublishable('com.github.GTNewHorizons:CodeChickenCore:1.4.17:dev')
+    devOnlyNonPublishable('com.github.GTNewHorizons:ProjectRed:4.12.39-GTNH:dev')
+    devOnlyNonPublishable('com.github.GTNewHorizons:Angelica:2.1.61:dev')
+    devOnlyNonPublishable('com.github.GTNewHorizons:Hodgepodge:2.7.179:dev')
+
+    runtimeOnlyNonPublishable('com.github.GTNewHorizons:EnderIO:2.10.44:dev')
+    runtimeOnlyNonPublishable('thaumcraft:Thaumcraft:1.7.10-4.2.3.5:dev') { transitive = false }
+    runtimeOnlyNonPublishable('com.github.GTNewHorizons:Baubles-Expanded:2.2.22-GTNH:dev') { transitive = false }
+    runtimeOnlyNonPublishable('com.github.GTNewHorizons:ThaumicHorizons:1.8.4:dev') { transitive = false }
+
+    testImplementation("com.falsepattern:chunkapi-mc1.7.10:0.8.2:dev")
+    testImplementation("com.github.GTNewHorizons:Angelica:2.1.61:dev") { transitive = false }
     testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
+    testRuntimeOnly("it.unimi.dsi:fastutil:8.5.18")
     testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }

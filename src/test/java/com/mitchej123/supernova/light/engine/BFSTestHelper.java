@@ -6,130 +6,99 @@ import net.minecraft.block.Block;
 import net.minecraft.init.Blocks;
 import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 
-/**
- * Utilities for populating engine caches and reading/writing light in BFS tests.
- */
 final class BFSTestHelper {
 
-    private static final int RGB_DIR_SHIFT = 40;
+    static final int RGB_DIR_SHIFT = 40;
 
     private BFSTestHelper() {}
 
-    /**
-     * Initialize the engine for tests centered on chunk (0,0) at worldY=64.
-     * Sets up encode offsets so world coords 0-15 map to the center chunk.
-     */
-    static void setupCenter(TestableBlockEngine engine) {
+    /** Center chunk (0,0), y=64. */
+    static void setupCenter(RGBEngineAccess engine) {
         engine.callSetupEncodeOffset(7, 64, 7);
     }
 
-    /**
-     * Populate a section with air blocks and initialized nibble arrays.
-     * chunkX/chunkZ are world chunk coords (not cache-relative).
-     */
-    static void populateAirSection(TestableBlockEngine engine, int chunkX, int sectionY, int chunkZ) {
-        populateSection(engine, chunkX, sectionY, chunkZ, Blocks.air);
+    static <E extends RGBEngineAccess> E centeredWithAir(E engine) {
+        setupCenter(engine);
+        populateAirSection(engine, 0, 4, 0);
+        return engine;
     }
 
-    /**
-     * Populate a section with a specific block and initialized nibble arrays.
-     */
-    static void populateSection(TestableBlockEngine engine, int chunkX, int sectionY, int chunkZ, Block block) {
-        int idx = sectionIndex(engine, chunkX, sectionY, chunkZ);
+    /** Chunks -1..1, sections 3..5: room for a full 15-level falloff. */
+    static <E extends RGBEngineAccess> E centeredNeighborhood(E engine) {
+        setupCenter(engine);
+        populateNeighborhood(engine, -1, 1, -1, 1, 3, 5);
+        return engine;
+    }
 
-        ExtendedBlockStorage section = new ExtendedBlockStorage(sectionY << 4, false);
-        if (block != Blocks.air) {
-            for (int x = 0; x < 16; x++) {
-                for (int y = 0; y < 16; y++) {
-                    for (int z = 0; z < 16; z++) {
-                        section.func_150818_a(x, y, z, block);
-                    }
-                }
-            }
-        }
-        engine.getSectionCache()[idx] = section;
+    /** World chunk coords, not cache-relative. */
+    static void populateAirSection(RGBEngineAccess engine, int chunkX, int sectionY, int chunkZ) {
+        final int idx = sectionIndex(engine, chunkX, sectionY, chunkZ);
+        engine.getSectionCache()[idx] = new TestSection(sectionY << 4, false);
 
-        // Initialize nibble arrays for all 3 channels + base cache
-        SWMRNibbleArray nibR = new SWMRNibbleArray();
+        // Engine assumes nibbleCacheR aliases nibbleCache.
+        final SWMRNibbleArray nibR = new SWMRNibbleArray();
         engine.getNibbleCache()[idx] = nibR;
         engine.getNibbleCacheR()[idx] = nibR;
         engine.getNibbleCacheG()[idx] = new SWMRNibbleArray();
         engine.getNibbleCacheB()[idx] = new SWMRNibbleArray();
     }
 
-    /**
-     * Set a specific block at world coordinates in the section cache.
-     */
-    static void setBlock(TestableBlockEngine engine, int worldX, int worldY, int worldZ, Block block) {
-        setBlock(engine, worldX, worldY, worldZ, block, 0);
+    static void populateNeighborhood(RGBEngineAccess engine, int cx0, int cx1, int cz0, int cz1, int sy0, int sy1) {
+        for (int cx = cx0; cx <= cx1; cx++) {
+            for (int cz = cz0; cz <= cz1; cz++) {
+                for (int sy = sy0; sy <= sy1; sy++) {
+                    populateAirSection(engine, cx, sy, cz);
+                }
+            }
+        }
     }
 
-    static void setBlock(TestableBlockEngine engine, int worldX, int worldY, int worldZ, Block block, int meta) {
-        int idx = sectionIndex(engine, worldX >> 4, worldY >> 4, worldZ >> 4);
-        ExtendedBlockStorage section = engine.getSectionCache()[idx];
+    static void setBlock(RGBEngineAccess engine, int worldX, int worldY, int worldZ, Block block) {
+        final int idx = sectionIndex(engine, worldX >> 4, worldY >> 4, worldZ >> 4);
+        final ExtendedBlockStorage section = engine.getSectionCache()[idx];
         if (section == null) {
             throw new IllegalStateException("Section not populated at chunk (" + (worldX >> 4) + ", " + (worldY >> 4) + ", " + (worldZ >> 4) + ")");
         }
         section.func_150818_a(worldX & 15, worldY & 15, worldZ & 15, block);
-        if (meta != 0) {
-            section.setExtBlockMetadata(worldX & 15, worldY & 15, worldZ & 15, meta);
-        }
     }
 
-    /**
-     * Write RGB light values through the engine's setLightLevel (handles packed cache).
-     */
-    static void setLight(TestableBlockEngine engine, int worldX, int worldY, int worldZ, int r, int g, int b) {
+    static void setLight(RGBEngineAccess engine, int worldX, int worldY, int worldZ, int r, int g, int b) {
         engine.setLightAt(worldX, worldY, worldZ, PackedColorLight.pack(r, g, b));
     }
 
-    /**
-     * Read packed RGB through the engine's getLightLevel (handles packed cache).
-     */
-    static int getLight(TestableBlockEngine engine, int worldX, int worldY, int worldZ) {
+    static int getLight(RGBEngineAccess engine, int worldX, int worldY, int worldZ) {
         return engine.getLightAt(worldX, worldY, worldZ);
     }
 
-    /**
-     * Enqueue a light increase at world coords with given RGB level.
-     * Sets the nibble values AND enqueues for propagation.
-     */
-    static void enqueueIncrease(TestableBlockEngine engine, int worldX, int worldY, int worldZ, int r, int g, int b) {
+    /** Writes the level as well as enqueueing it. */
+    static void enqueueIncrease(RGBEngineAccess engine, int worldX, int worldY, int worldZ, int r, int g, int b) {
         setLight(engine, worldX, worldY, worldZ, r, g, b);
-        int packedRGB = PackedColorLight.pack(r, g, b);
-        Block block = getBlockAt(engine, worldX, worldY, worldZ);
-        long entry = SupernovaEngine.encodeCoords(worldX, worldZ, worldY, engine.getCoordinateOffset())
-            | PackedColorLightQueue.encodeQueuePackedRGB(packedRGB)
-            | (((long) SupernovaEngine.ALL_DIRECTIONS_BITSET) << RGB_DIR_SHIFT)
-            | SupernovaEngine.sidedFlag(block);
-        engine.enqueueIncrease(entry);
+        engine.enqueueIncrease(queueEntry(engine, worldX, worldY, worldZ, PackedColorLight.pack(r, g, b)));
     }
 
-    /**
-     * Enqueue a light decrease at world coords with given RGB level.
-     */
-    static void enqueueDecrease(TestableBlockEngine engine, int worldX, int worldY, int worldZ, int r, int g, int b) {
-        int packedRGB = PackedColorLight.pack(r, g, b);
-        Block block = getBlockAt(engine, worldX, worldY, worldZ);
-        long entry = SupernovaEngine.encodeCoords(worldX, worldZ, worldY, engine.getCoordinateOffset())
-            | PackedColorLightQueue.encodeQueuePackedRGB(packedRGB)
-            | (((long) SupernovaEngine.ALL_DIRECTIONS_BITSET) << RGB_DIR_SHIFT)
-            | SupernovaEngine.sidedFlag(block);
-        engine.enqueueDecrease(entry);
+    static void enqueueDecrease(RGBEngineAccess engine, int worldX, int worldY, int worldZ, int r, int g, int b) {
+        engine.enqueueDecrease(queueEntry(engine, worldX, worldY, worldZ, PackedColorLight.pack(r, g, b)));
     }
 
-    private static Block getBlockAt(TestableBlockEngine engine, int worldX, int worldY, int worldZ) {
-        int idx = sectionIndex(engine, worldX >> 4, worldY >> 4, worldZ >> 4);
-        ExtendedBlockStorage section = engine.getSectionCache()[idx];
+    private static long queueEntry(RGBEngineAccess engine, int worldX, int worldY, int worldZ, int packedRGB) {
+        return SupernovaEngine.encodeCoords(worldX, worldZ, worldY, engine.getCoordinateOffset())
+            | PackedColorLightQueue.encodeQueuePackedRGB(packedRGB)
+            | (((long) SupernovaEngine.ALL_DIRECTIONS_BITSET) << RGB_DIR_SHIFT)
+            | SupernovaEngine.sidedFlag(Block.getIdFromBlock(getBlockAt(engine, worldX, worldY, worldZ)));
+    }
+
+    private static Block getBlockAt(RGBEngineAccess engine, int worldX, int worldY, int worldZ) {
+        final int idx = sectionIndex(engine, worldX >> 4, worldY >> 4, worldZ >> 4);
+        final ExtendedBlockStorage section = engine.getSectionCache()[idx];
         if (section == null) return Blocks.air;
         return section.getBlockByExtId(worldX & 15, worldY & 15, worldZ & 15);
     }
 
-    static int sectionIndex(TestableBlockEngine engine, int chunkX, int sectionY, int chunkZ) {
+    static int sectionIndex(RGBEngineAccess engine, int chunkX, int sectionY, int chunkZ) {
         return chunkX + 5 * chunkZ + (5 * 5) * sectionY + engine.getChunkSectionIndexOffset();
     }
 
-    private static int localIndex(int worldX, int worldY, int worldZ) {
+    static int localIndex(int worldX, int worldY, int worldZ) {
         return (worldX & 15) | ((worldZ & 15) << 4) | ((worldY & 15) << 8);
     }
 }

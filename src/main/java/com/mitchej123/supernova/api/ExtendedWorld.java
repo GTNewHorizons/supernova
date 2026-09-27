@@ -17,11 +17,11 @@ public interface ExtendedWorld {
     Chunk supernova$getAnyChunkImmediately(int chunkX, int chunkZ);
 
     /**
-     * Returns {@code true} if the chunk is queued for initial lighting but BFS has not yet completed. Use to defer gameplay logic (e.g. mob spawning) until
-     * lighting is ready.
+     * Reports queued or in-flight lighting on either lane for this chunk.
      *
      * @param chunkX chunk X coordinate
      * @param chunkZ chunk Z coordinate
+     * @return whether lighting is pending
      */
     boolean supernova$hasChunkPendingLight(int chunkX, int chunkZ);
 }

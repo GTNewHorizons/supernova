@@ -13,9 +13,9 @@ public abstract class MixinWorldServer {
 
     @Inject(method = "tick", at = @At("TAIL"))
     private void supernova$tickLighting(CallbackInfo ci) {
-        final WorldLightManager iface = ((SupernovaWorld) this).supernova$getLightManager();
+        final WorldLightManager iface = ((SupernovaWorld) this).supernova$lightManagerIfPresent();
         if (iface != null && iface.hasUpdates()) {
-            iface.scheduleUpdate();
+            iface.tick();
         }
     }
 }

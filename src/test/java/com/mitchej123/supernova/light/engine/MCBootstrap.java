@@ -11,13 +11,30 @@ import sun.misc.Unsafe;
 import java.lang.reflect.Field;
 
 /**
- * Minimal MC bootstrap for unit tests.
- * <p>
- * Swaps {@code Block.blockRegistry} with a plain {@link RegistryNamespacedDefaultedByKey} to bypass FML's {@code FMLControlledNamespacedRegistry} which
- * requires {@code LaunchClassLoader}. Block instances are created via {@link Unsafe#allocateInstance} to skip the instance initializer that casts the registry
- * to FML's type.
+ * Minimal MC bootstrap: swaps {@code Block.blockRegistry} for a plain {@link RegistryNamespacedDefaultedByKey}, since FML's requires {@code LaunchClassLoader}.
+ * Blocks come from {@link Unsafe#allocateInstance} to skip the initializer that casts that registry to FML's type.
  */
 public final class MCBootstrap {
+
+    /** Kept in one place so ids never collide in the shared registry. */
+    public static final class TestIds {
+
+        public static final int LAMP = 183;
+        public static final int LAMP_NEG = 184;
+        public static final int LAMP_REMAP = 185, LAMP_REMAP_TARGET = 700;
+        public static final int SAFE_ACCESS_PROBE = 190;
+        public static final int PARTIAL_META_LAMP = 195;
+        public static final int VANILLA_FALLBACK_EMITTER = 196;
+        public static final int FACE_OCCLUDER = 197;
+        public static final int INDEX_PROBE = 200;
+        public static final int TILE_LAMP = 201;
+        public static final int GREEN_EDGE_LAMP = 203;
+        public static final int REMAP_LAMP = 300, REMAP_LAMP_TARGET = 555;
+        public static final int REMAP_GLASS = 310, REMAP_GLASS_TARGET = 600;
+        public static final int REMAP_SIDED = 320, REMAP_SIDED_TARGET = 610;
+
+        private TestIds() {}
+    }
 
     private static boolean initialized = false;
     private static World serverWorld;
@@ -28,29 +45,24 @@ public final class MCBootstrap {
 
         final Unsafe unsafe = getUnsafe();
 
+        // Run Block's <clinit> before the registry swap; a later first access (Blocks.air) would run it and clobber the swap.
         // noinspection ResultOfMethodCallIgnored
         Block.blockRegistry.getClass();
 
         RegistryNamespacedDefaultedByKey registry = new RegistryNamespacedDefaultedByKey("minecraft:air");
         setStaticField(unsafe, Block.class, "blockRegistry", registry);
 
-        // Create blocks via Unsafe -- skips Block's instance initializer which does:
-        //   delegate = ((FMLControlledNamespacedRegistry)blockRegistry).getDelegate(this, Block.class)
-        Block air = createBlock(unsafe, Material.air, 0, false, 0);
-        Block stone = createBlock(unsafe, Material.rock, 255, true, 0);
+        Block air = createBlock(unsafe, Block.class, Material.air, 0, false, 0);
+        Block stone = createBlock(unsafe, Block.class, Material.rock, 255, true, 0);
 
-        // Register in the clean registry. This populates both name->object and id->object maps.
         registry.addObject(0, "air", air);
         registry.addObject(1, "stone", stone);
 
-        // Blocks class clinit reads from blockRegistry:
-        //   public static final Block air = (Block)Block.blockRegistry.getObject("air");
         @SuppressWarnings("unused") Block forceInit = net.minecraft.init.Blocks.air;
 
         WorldUtil.setBounds(0, 15);
 
-        // Create stub World via Unsafe (skips constructor entirely)
-        serverWorld = createStubWorld(unsafe);
+        serverWorld = createStubWorld(false);
     }
 
     public static World getServerWorld() {
@@ -58,23 +70,42 @@ public final class MCBootstrap {
         return serverWorld;
     }
 
-    private static Block createBlock(Unsafe unsafe, Material material, int lightOpacity, boolean opaque, int lightValue) {
+    /** No constructor runs. */
+    public static <T> T allocate(Class<T> clazz) {
         try {
-            Block block = (Block) unsafe.allocateInstance(Block.class);
-            putField(unsafe, block, Block.class, "blockMaterial", material);
-            putInt(unsafe, block, Block.class, "lightOpacity", lightOpacity);
-            putBoolean(unsafe, block, Block.class, "opaque", opaque);
-            putInt(unsafe, block, Block.class, "lightValue", lightValue);
-            return block;
-        } catch (InstantiationException e) {
-            throw new RuntimeException("Failed to create Block instance", e);
+            return clazz.cast(getUnsafe().allocateInstance(clazz));
+        } catch (final InstantiationException e) {
+            throw new RuntimeException("Failed to allocate " + clazz.getName(), e);
         }
     }
 
-    private static World createStubWorld(Unsafe unsafe) {
+    public static void rebindBlock(int newId, String name, Block block) {
+        ((RegistryNamespacedDefaultedByKey) Block.blockRegistry).addObject(newId, name, block);
+    }
+
+    /** {@code type} is allocated without running any constructor. */
+    public static Block registerTestBlock(int id, String name, Class<? extends Block> type, int lightOpacity, boolean opaque, int lightValue) {
+        if (!initialized) throw new IllegalStateException("Call MCBootstrap.init() first");
+        final Block block = createBlock(getUnsafe(), type, Material.rock, lightOpacity, opaque, lightValue);
+        ((RegistryNamespacedDefaultedByKey) Block.blockRegistry).addObject(id, name, block);
+        return block;
+    }
+
+    private static Block createBlock(Unsafe unsafe, Class<? extends Block> type, Material material, int lightOpacity, boolean opaque, int lightValue) {
+        final Block block = allocate(type);
+        putField(unsafe, block, Block.class, "blockMaterial", material);
+        putInt(unsafe, block, Block.class, "lightOpacity", lightOpacity);
+        putBoolean(unsafe, block, Block.class, "opaque", opaque);
+        putInt(unsafe, block, Block.class, "lightValue", lightValue);
+        return block;
+    }
+
+    public static World createStubWorld(boolean remote) {
+        if (!initialized) throw new IllegalStateException("Call MCBootstrap.init() first");
+        final Unsafe unsafe = getUnsafe();
         try {
             World world = (World) unsafe.allocateInstance(WorldServer.class);
-            putBoolean(unsafe, world, World.class, "isRemote", false);
+            putBoolean(unsafe, world, World.class, "isRemote", remote);
             return world;
         } catch (InstantiationException e) {
             throw new RuntimeException("Failed to create stub World", e);

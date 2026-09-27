@@ -11,7 +11,7 @@ public enum TintBlendMode {
 
     ADDITIVE {
         @Override
-        public void computeTint(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
+        protected void computeTintImpl(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
             float tr = br + sr;
             float tg = bg + sg;
             float tb = bb + sb;
@@ -28,7 +28,7 @@ public enum TintBlendMode {
 
     SQUARED_WEIGHT {
         @Override
-        public void computeTint(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
+        protected void computeTintImpl(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
             float blockMax = Math.max(br, Math.max(bg, bb));
             float skyMax = Math.max(sr, Math.max(sg, sb));
 
@@ -58,7 +58,7 @@ public enum TintBlendMode {
 
     LINEAR_WEIGHT {
         @Override
-        public void computeTint(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
+        protected void computeTintImpl(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
             float blockMax = Math.max(br, Math.max(bg, bb));
             float skyMax = Math.max(sr, Math.max(sg, sb));
 
@@ -86,7 +86,7 @@ public enum TintBlendMode {
 
     OKLAB {
         @Override
-        public void computeTint(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
+        protected void computeTintImpl(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
             float blockMax = Math.max(br, Math.max(bg, bb));
             float skyMax = Math.max(sr, Math.max(sg, sb));
 
@@ -144,8 +144,8 @@ public enum TintBlendMode {
 
     VIVID {
         @Override
-        public void computeTint(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
-            SQUARED_WEIGHT.computeTint(br, bg, bb, sr, sg, sb, out);
+        protected void computeTintImpl(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
+            SQUARED_WEIGHT.computeTintImpl(br, bg, bb, sr, sg, sb, out);
             if (out[0] >= 1.0f && out[1] >= 1.0f && out[2] >= 1.0f) return;
 
             float avg = (out[0] + out[1] + out[2]) * (1.0f / 3.0f);
@@ -177,9 +177,18 @@ public enum TintBlendMode {
             }
         }
     }
-
     /** Currently active blend mode. Changed at runtime via keybind or config. */
+
     public static volatile TintBlendMode current = SQUARED_WEIGHT;
+
+    /**
+     * 0 (neutral white) to 1 (full saturation): hue is normalized against the channel max, so at low levels it is 4-bit quantization noise.
+     * Curve is vanilla's own {@code WorldProvider.generateLightBrightnessTable}.
+     */
+    static float hueConfidence(float maxLight) {
+        final float l = Math.min(15f, Math.max(0f, maxLight));
+        return l / (60f - 3f * l);
+    }
 
     static void linearRgbToOkLab(float r, float g, float b, float[] out, int offset) {
         float l = 0.4122214708f * r + 0.5363325363f * g + 0.0514459929f * b;
@@ -191,5 +200,15 @@ public enum TintBlendMode {
         out[offset + 2] = 0.0259040371f * l_ + 0.7827717662f * m_ - 0.8086757660f * s_;
     }
 
-    public abstract void computeTint(float br, float bg, float bb, float sr, float sg, float sb, float[] out);
+    public final void computeTint(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
+        computeTintImpl(br, bg, bb, sr, sg, sb, out);
+        final float maxLight = Math.max(Math.max(br, Math.max(bg, bb)), Math.max(sr, Math.max(sg, sb)));
+        final float w = hueConfidence(maxLight);
+        if (w >= 1f) return;
+        out[0] = 1f + (out[0] - 1f) * w;
+        out[1] = 1f + (out[1] - 1f) * w;
+        out[2] = 1f + (out[2] - 1f) * w;
+    }
+
+    protected abstract void computeTintImpl(float br, float bg, float bb, float sr, float sg, float sb, float[] out);
 }

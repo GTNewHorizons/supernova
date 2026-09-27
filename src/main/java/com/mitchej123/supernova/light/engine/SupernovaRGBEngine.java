@@ -14,19 +14,20 @@ public abstract class SupernovaRGBEngine extends SupernovaEngine {
     protected static final int RGB_DIR_SHIFT = 40;
     protected static final int WHITE = PackedColorLight.pack(15, 15, 15);
     protected static final int MIN_ABSORPTION = PackedColorLight.pack(1, 1, 1);
+    private static final byte[] ZERO_BYTES = new byte[SWMRNibbleArray.ARRAY_SIZE];
 
-    // Per-channel nibble caches for RGB. nibbleCacheR aliases nibbleCache (same object refs)
+    // nibbleCacheR holds the same objects as nibbleCache, not a copy.
     protected final SWMRNibbleArray[] nibbleCacheR;
     protected final SWMRNibbleArray[] nibbleCacheG;
     protected final SWMRNibbleArray[] nibbleCacheB;
 
-    // Packed RGB cache -- stores pre-packed 0x0R0G0B values per section for fast BFS access.
+    // Per-section 0x0R0G0B values; the BFS reads these instead of three nibbles.
     protected final int[][] packedRGBCache;
     protected final boolean[] packedCacheDirty;
     protected final int[] packedOr;
     protected final int[] packedAnd;
 
-    // Temporary storage for fresh nibbles during light() -- saved to chunk after lighting
+    // Live only for the duration of light(); saveExtraLightNibbles hands them to the chunk.
     protected SWMRNibbleArray[] currentLightNibblesG;
     protected SWMRNibbleArray[] currentLightNibblesB;
 
@@ -43,13 +44,11 @@ public abstract class SupernovaRGBEngine extends SupernovaEngine {
         this.packedAnd = new int[cacheSize];
     }
 
-    /** Save G/B nibbles to the chunk after lighting. Block -> setBlockNibblesG/B, Sky -> setSkyNibblesG/B. */
     protected abstract void saveChannelNibbles(SupernovaChunk chunk, SWMRNibbleArray[] g, SWMRNibbleArray[] b);
 
-    /** Load R/G/B nibbles from chunk into cache. Block -> getBlockNibblesR/G/B, Sky -> getSkyNibblesR/G/B. */
     protected abstract void loadChannelNibbles(SupernovaChunk chunk, int cx, int cz);
 
-    /** Sync dirty nibble data back to vanilla ExtendedBlockStorage for save persistence. */
+    /** Writes the RGB max back into vanilla's arrays: what the save file and the chunk packet carry. */
     protected abstract void syncToVanilla(ExtendedBlockStorage section, SWMRNibbleArray nibR, SWMRNibbleArray nibG, SWMRNibbleArray nibB, int minByte, int maxByte);
 
     protected void setChannelNibblesForChunkInCache(final SWMRNibbleArray[] cache, final int chunkX, final int chunkZ, final SWMRNibbleArray[] nibbles) {
@@ -143,27 +142,26 @@ public abstract class SupernovaRGBEngine extends SupernovaEngine {
     }
 
     @Override
-    protected void setLightLevel(final int worldX, final int worldY, final int worldZ, final int packedRGB) {
-        final int idx = (worldX >> 4) + 5 * (worldZ >> 4) + (5 * 5) * (worldY >> 4) + this.chunkSectionIndexOffset;
-        setLightLevelInCache(idx, (worldX & 15) | ((worldZ & 15) << 4) | ((worldY & 15) << 8), packedRGB);
-        this.postLightUpdate(idx);
-    }
-
-    protected void setLightLevelInCache(final int idx, final int localIndex, final int packedRGB) {
+    protected boolean setLightLevelInCache(final int idx, final int localIndex, final int packedRGB) {
         final int[] packed = this.packedRGBCache[idx];
         if (packed != null) {
+            final boolean changed = packed[localIndex] != packedRGB;
+            // An equal write over an UNINIT section must still dirty the cache: the unpack is what promotes the nibble to INIT.
+            if (!changed && this.nibbleCacheR[idx].isInitialisedOrHiddenUpdating()) return false;
             packed[localIndex] = packedRGB;
             this.packedCacheDirty[idx] = true;
             this.packedOr[idx] |= packedRGB;
             this.packedAnd[idx] &= packedRGB;
-            return;
+            return changed;
         }
+        boolean changed = false;
         final SWMRNibbleArray nibR = this.nibbleCacheR[idx];
-        if (nibR != null) nibR.set(localIndex, PackedColorLight.red(packedRGB));
+        if (nibR != null) changed = nibR.setChanged(localIndex, PackedColorLight.red(packedRGB));
         final SWMRNibbleArray nibG = this.nibbleCacheG[idx];
-        if (nibG != null) nibG.set(localIndex, PackedColorLight.green(packedRGB));
+        if (nibG != null) changed |= nibG.setChanged(localIndex, PackedColorLight.green(packedRGB));
         final SWMRNibbleArray nibB = this.nibbleCacheB[idx];
-        if (nibB != null) nibB.set(localIndex, PackedColorLight.blue(packedRGB));
+        if (nibB != null) changed |= nibB.setChanged(localIndex, PackedColorLight.blue(packedRGB));
+        return changed;
     }
 
     protected void packSectionToCache(final int idx) {
@@ -191,43 +189,20 @@ public abstract class SupernovaRGBEngine extends SupernovaEngine {
             return;
         }
 
-        final byte[] rData = nibR.getUpdatingStorage();
-        if (rData == null) return;
-        final byte[] gData = nibG != null ? nibG.getUpdatingStorage() : null;
-        final byte[] bData = nibB != null ? nibB.getUpdatingStorage() : null;
+        final byte[] rData = nibR.getUpdatingStorage() == null ? ZERO_BYTES : nibR.getUpdatingStorage();
+        final byte[] gData = nibG == null || nibG.getUpdatingStorage() == null ? ZERO_BYTES : nibG.getUpdatingStorage();
+        final byte[] bData = nibB == null || nibB.getUpdatingStorage() == null ? ZERO_BYTES : nibB.getUpdatingStorage();
 
         final int[] packedArr = acquirePackedArray();
         int or = 0, and = WHITE;
-        if (gData != null && bData != null) {
-            for (int byteIdx = 0; byteIdx < SWMRNibbleArray.ARRAY_SIZE; byteIdx++) {
-                final int combined = ((rData[byteIdx] & 0xFF) << 16) | ((gData[byteIdx] & 0xFF) << 8) | (bData[byteIdx] & 0xFF);
-                final int lo = combined & 0x0F0F0F;
-                final int hi = (combined >>> 4) & 0x0F0F0F;
-                packedArr[byteIdx * 2] = lo;
-                packedArr[byteIdx * 2 + 1] = hi;
-                or |= lo | hi;
-                and &= lo & hi;
-            }
-        } else if (gData != null) {
-            for (int byteIdx = 0; byteIdx < SWMRNibbleArray.ARRAY_SIZE; byteIdx++) {
-                final int combined = ((rData[byteIdx] & 0xFF) << 16) | ((gData[byteIdx] & 0xFF) << 8);
-                final int lo = combined & 0x0F0F0F;
-                final int hi = (combined >>> 4) & 0x0F0F0F;
-                packedArr[byteIdx * 2] = lo;
-                packedArr[byteIdx * 2 + 1] = hi;
-                or |= lo | hi;
-                and &= lo & hi;
-            }
-        } else {
-            for (int byteIdx = 0; byteIdx < SWMRNibbleArray.ARRAY_SIZE; byteIdx++) {
-                final int combined = (rData[byteIdx] & 0xFF) << 16;
-                final int lo = combined & 0x0F0F0F;
-                final int hi = (combined >>> 4) & 0x0F0F0F;
-                packedArr[byteIdx * 2] = lo;
-                packedArr[byteIdx * 2 + 1] = hi;
-                or |= lo | hi;
-                and &= lo & hi;
-            }
+        for (int byteIdx = 0; byteIdx < SWMRNibbleArray.ARRAY_SIZE; byteIdx++) {
+            final int combined = ((rData[byteIdx] & 0xFF) << 16) | ((gData[byteIdx] & 0xFF) << 8) | (bData[byteIdx] & 0xFF);
+            final int lo = combined & 0x0F0F0F;
+            final int hi = (combined >>> 4) & 0x0F0F0F;
+            packedArr[byteIdx * 2] = lo;
+            packedArr[byteIdx * 2 + 1] = hi;
+            or |= lo | hi;
+            and &= lo & hi;
         }
         this.packedRGBCache[idx] = packedArr;
         this.packedCacheDirty[idx] = false;
@@ -280,9 +255,12 @@ public abstract class SupernovaRGBEngine extends SupernovaEngine {
     }
 
     @Override
-    protected void updateVisibleExtra() {
+    protected void beforeUpdateVisible() {
         this.unpackDirtySections();
+    }
 
+    @Override
+    protected void updateVisibleExtra() {
         for (int index = 0, max = this.nibbleCacheG.length; index < max; ++index) {
             final SWMRNibbleArray nibR = this.nibbleCacheR[index];
             final SWMRNibbleArray nibG = this.nibbleCacheG[index];
@@ -303,9 +281,16 @@ public abstract class SupernovaRGBEngine extends SupernovaEngine {
                 dirtyMax = Math.max(dirtyMax, nibB.getDirtyByteMax());
             }
 
-            if (nibR != null && nibR.isDirty()) nibR.updateVisible();
-            if (nibG != null && nibG.isDirty()) nibG.updateVisible();
-            if (nibB != null && nibB.isDirty()) nibB.updateVisible();
+            final boolean dirtyR = nibR != null && nibR.isDirty();
+            final boolean dirtyG = nibG != null && nibG.isDirty();
+            final boolean dirtyB = nibB != null && nibB.isDirty();
+            if (dirtyR || dirtyG || dirtyB) {
+                this.markChunkModified(index);
+            }
+
+            if (dirtyR) nibR.updateVisible();
+            if (dirtyG) nibG.updateVisible();
+            if (dirtyB) nibB.updateVisible();
 
             if (nibR != null) nibR.resetDirtyRange();
             if (nibG != null) nibG.resetDirtyRange();

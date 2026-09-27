@@ -1,5 +1,6 @@
 package com.mitchej123.supernova.mixin.early.engine;
 
+import com.mitchej123.supernova.api.ExtendedSection;
 import com.mitchej123.supernova.config.SupernovaConfig;
 import com.mitchej123.supernova.core.SupernovaCore;
 import com.mitchej123.supernova.light.ChunkLightHelper;
@@ -24,6 +25,7 @@ import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.ModifyVariable;
 import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(Chunk.class)
 public abstract class MixinChunk implements SupernovaChunk {
@@ -49,15 +51,18 @@ public abstract class MixinChunk implements SupernovaChunk {
     @Shadow
     public abstract ExtendedBlockStorage[] getBlockStorageArray();
 
-    @Unique private SWMRNibbleArray[] supernova$skyNibbles;
-    @Unique private boolean[] supernova$skyEmptinessMap;
-    @Unique private SWMRNibbleArray[] supernova$blockNibblesR;
-    @Unique private SWMRNibbleArray[] supernova$blockNibblesG;
-    @Unique private SWMRNibbleArray[] supernova$blockNibblesB;
-    @Unique private boolean[] supernova$blockEmptinessMap;
-    @Unique private SWMRNibbleArray[] supernova$skyNibblesG;
-    @Unique private SWMRNibbleArray[] supernova$skyNibblesB;
+    @Unique private volatile SWMRNibbleArray[] supernova$skyNibbles;
+    @Unique private volatile boolean[] supernova$skyEmptinessMap;
+    @Unique private volatile SWMRNibbleArray[] supernova$blockNibblesR;
+    @Unique private volatile SWMRNibbleArray[] supernova$blockNibblesG;
+    @Unique private volatile SWMRNibbleArray[] supernova$blockNibblesB;
+    @Unique private volatile boolean[] supernova$blockEmptinessMap;
+    @Unique private volatile SWMRNibbleArray[] supernova$skyNibblesG;
+    @Unique private volatile SWMRNibbleArray[] supernova$skyNibblesB;
     @Unique private volatile boolean supernova$lightReady;
+    @Unique private volatile boolean supernova$lightUsable;
+    @Unique private volatile boolean supernova$blockLightDirty;
+    @Unique private volatile boolean supernova$skyLightDirty;
 
     @Inject(method = "<init>(Lnet/minecraft/world/World;II)V", at = @At("RETURN"))
     private void supernova$onInit(World world, int cx, int cz, CallbackInfo ci) {
@@ -69,7 +74,7 @@ public abstract class MixinChunk implements SupernovaChunk {
         this.supernova$skyNibbles = SupernovaEngine.getFilledEmptyLight();
         this.supernova$blockNibblesR = SupernovaEngine.getFilledEmptyLight();
         if (SupernovaConfig.isScalarMode()) {
-            // Scalar mode: G/B arrays stay null -- engines only use R
+            // Scalar mode: G/B stay null; engines read only R.
             this.supernova$skyNibblesG = null;
             this.supernova$skyNibblesB = null;
             this.supernova$blockNibblesG = null;
@@ -82,7 +87,6 @@ public abstract class MixinChunk implements SupernovaChunk {
         }
     }
 
-    // Import vanilla light data and trigger block engine for chunks without saved RGB data.
     @Inject(method = "onChunkLoad", at = @At("HEAD"))
     private void supernova$onChunkLoad(CallbackInfo ci) {
         if (!SupernovaCore.CHUNKAPI_PRESENT && this.isLightPopulated) {
@@ -94,29 +98,44 @@ public abstract class MixinChunk implements SupernovaChunk {
         if (this.worldObj != null) {
             final WorldLightManager iface = ((SupernovaWorld) this.worldObj).supernova$getLightManager();
             if (iface != null) {
-                // Register in ConcurrentHashMap for worker thread access (both client and server)
+                // Registered in the SnapshotChunkMap the light workers read (both client and server).
                 iface.registerChunk((Chunk) (Object) this);
 
                 if (hasBlockData) {
-                    // Chunk has saved Supernova data -- import vanilla sky light where missing and mark ready.
                     ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, this.storageArrays, true);
-                    ((SupernovaChunk) this).setLightReady(true);
+                    this.setLightReady(true);
                 } else if (!this.worldObj.isRemote) {
-                    // Import vanilla sky so game logic has correct values during BFS backlog
+                    // Game logic reads sky before the BFS backlog clears.
                     ChunkLightHelper.importVanillaSky(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, this.storageArrays, false);
                     final Boolean[] emptySections = SupernovaEngine.getEmptySectionsForChunk((Chunk) (Object) this);
                     iface.queueChunkLight(this.xPosition, this.zPosition, (Chunk) (Object) this, emptySections);
-                    iface.scheduleUpdate();
                 }
             }
         }
 
-        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, this.storageArrays);
+        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, this.storageArrays);
+    }
+
+    @Inject(method = "func_150812_a", at = @At("RETURN"))
+    private void supernova$onTileEntityAdded(int x, int y, int z, net.minecraft.tileentity.TileEntity tile, CallbackInfo ci) {
+        supernova$tileEntityChanged(x, y, z);
+    }
+
+    @Inject(method = "removeTileEntity", at = @At("RETURN"))
+    private void supernova$onTileEntityRemoved(int x, int y, int z, CallbackInfo ci) {
+        supernova$tileEntityChanged(x, y, z);
+    }
+
+    @Unique
+    private void supernova$tileEntityChanged(final int x, final int y, final int z) {
+        if (this.worldObj == null) return;
+        final WorldLightManager iface = ((SupernovaWorld) this.worldObj).supernova$lightManagerIfPresent();
+        if (iface != null) iface.tileEntityChanged((this.xPosition << 4) | x, y, (this.zPosition << 4) | z);
     }
 
     @Override
     public void syncLightToVanilla() {
-        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, this.storageArrays);
+        ChunkLightHelper.syncSkyToVanilla(this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB, this.storageArrays);
         ChunkLightHelper.syncBlockToVanilla(
             this.supernova$blockNibblesR, this.supernova$blockNibblesG, this.supernova$blockNibblesB,
             this.storageArrays);
@@ -179,7 +198,26 @@ public abstract class MixinChunk implements SupernovaChunk {
     @Override
     public void setLightReady(boolean ready) {this.supernova$lightReady = ready;}
 
-    // Compute heightmap only; actual lighting deferred to onChunkLoad where neighbor chunks are available for proper edge propagation.
+    @Override
+    public void setLightUsable(boolean usable) {this.supernova$lightUsable = usable;}
+
+    @Override
+    public void markLightDirty(boolean sky) {if (sky) this.supernova$skyLightDirty = true; else this.supernova$blockLightDirty = true;}
+
+    @Override
+    public void clearLightDirty(boolean sky) {if (sky) this.supernova$skyLightDirty = false; else this.supernova$blockLightDirty = false;}
+
+    /** Cleared before the light is written, so a worker's mark landing during the write survives and the chunk saves again. */
+    @Inject(method = "needsSaving", at = @At("RETURN"), cancellable = true)
+    private void supernova$needsSavingForLight(boolean flag, CallbackInfoReturnable<Boolean> cir) {
+        if (!cir.getReturnValueZ() && (this.supernova$blockLightDirty || this.supernova$skyLightDirty)) cir.setReturnValue(true);
+    }
+
+    // Disjunction keeps the pair monotone, so the saved-light load path can set ready alone.
+    @Override
+    public boolean isLightUsable() {return this.supernova$lightReady || this.supernova$lightUsable;}
+
+    // Heightmap only; lighting waits for onChunkLoad, where neighbors exist for edge propagation.
     // @Inject+cancel instead of @Overwrite so other mods' injectors into this method don't crash.
     @Inject(method = "generateSkylightMap", at = @At("HEAD"), cancellable = true)
     private void supernova$generateSkylightMap(CallbackInfo ci) {
@@ -202,8 +240,7 @@ public abstract class MixinChunk implements SupernovaChunk {
             }
         }
 
-        // Vanilla-style column walk: propagate sky light top-down through block opacity. BFS will compute proper RGB sky light later; this provides a correct
-        // scalar baseline so chunk packets carry reasonable initial values before BFS runs.
+        // Scalar baseline so chunk packets carry sane sky values before the RGB BFS runs.
         if (!this.worldObj.provider.hasNoSky) {
             supernova$fillVanillaSkyColumn(topSegment);
         }
@@ -217,8 +254,7 @@ public abstract class MixinChunk implements SupernovaChunk {
      * @reason Supernova handles skylight column updates via updateLightByType
      */
     @Overwrite
-    public void relightBlock(int x, int y, int z) {
-        // Keep heightmap updated
+    private void relightBlock(int x, int y, int z) {
         final int heightMapIdx = z << 4 | x;
         final int currentHeight = this.heightMap[heightMapIdx];
         int newHeight = Math.max(y + 1, currentHeight);
@@ -227,22 +263,28 @@ public abstract class MixinChunk implements SupernovaChunk {
             --newHeight;
         }
 
-        this.heightMap[heightMapIdx] = newHeight;
-
-        if (newHeight < this.heightMapMinimum) {
-            this.heightMapMinimum = newHeight;
-        } else if (currentHeight == this.heightMapMinimum) {
-            this.heightMapMinimum = Integer.MAX_VALUE;
-            for (int i = 0; i < 256; ++i) {
-                if (this.heightMap[i] < this.heightMapMinimum) {
-                    this.heightMapMinimum = this.heightMap[i];
-                }
-            }
+        if (newHeight != currentHeight) {
+            this.worldObj.markBlocksDirtyVertical(x + this.xPosition * 16, z + this.zPosition * 16, newHeight, currentHeight);
         }
 
-        // Update vanilla sky nibbles for this column so newly created sections (e.g. tall trees placed during population) have correct initial sky values.
-        if (!this.worldObj.provider.hasNoSky) {
-            supernova$fillVanillaSkyForColumn(x, z, this.getTopFilledSegment());
+        this.heightMap[heightMapIdx] = newHeight;
+
+        if (newHeight != currentHeight) {
+            if (newHeight < this.heightMapMinimum) {
+                this.heightMapMinimum = newHeight;
+            } else if (currentHeight == this.heightMapMinimum) {
+                this.heightMapMinimum = Integer.MAX_VALUE;
+                for (int i = 0; i < 256; ++i) {
+                    if (this.heightMap[i] < this.heightMapMinimum) {
+                        this.heightMapMinimum = this.heightMap[i];
+                    }
+                }
+            }
+
+            // Sections created during population (tall trees) otherwise ship zero sky.
+            if (!this.worldObj.provider.hasNoSky) {
+                supernova$fillVanillaSkyForColumn(x, z, this.getTopFilledSegment());
+            }
         }
 
         this.isModified = true;
@@ -257,10 +299,7 @@ public abstract class MixinChunk implements SupernovaChunk {
         }
     }
 
-    /**
-     * Vanilla-style column walk for a single (x, z): propagate sky=15 top-down, attenuating by block opacity. Below the first opaque block, even transparent
-     * blocks attenuate by 1.
-     */
+    /** Vanilla column walk: sky=15 top-down by opacity; below the first opaque block even transparent blocks attenuate by 1. */
     @Unique
     private void supernova$fillVanillaSkyForColumn(final int x, final int z, final int topSegment) {
         int skyLevel = 15;
@@ -290,38 +329,15 @@ public abstract class MixinChunk implements SupernovaChunk {
      * @reason Supernova handles edge checks separately
      */
     @Overwrite
-    public void recheckGaps(boolean onlyOne) {
-        // no-op: Supernova handles skylight gap checks
-    }
+    private void recheckGaps(boolean onlyOne) {}
 
     /**
      * @author Supernova
-     * @reason Gate isLightPopulated on this chunk + 3×3 neighborhood being light-ready.
+     * @reason isLightPopulated also gates markAndNotifyBlock, so the readiness gate lives at the chunk send site
      */
     @Overwrite
     public void func_150809_p() {
         this.isTerrainPopulated = true;
-        supernova$trySetLightPopulated();
-    }
-
-    @Unique
-    private void supernova$trySetLightPopulated() {
-        if (this.isLightPopulated) return;
-        if (!this.supernova$lightReady) return;
-        if (this.worldObj == null) return;
-
-        final WorldLightManager iface = ((SupernovaWorld) this.worldObj).supernova$getLightManager();
-        if (iface == null) return;
-
-        for (int dx = -1; dx <= 1; dx++) {
-            for (int dz = -1; dz <= 1; dz++) {
-                if (dx == 0 && dz == 0) continue;
-                final Chunk neighbor = iface.getLoadedChunk(this.xPosition + dx, this.zPosition + dz);
-                if (neighbor == null || !((SupernovaChunk) neighbor).isLightReady()) {
-                    return;
-                }
-            }
-        }
         this.isLightPopulated = true;
     }
 
@@ -339,9 +355,7 @@ public abstract class MixinChunk implements SupernovaChunk {
      * @reason Vanilla per-tick relight checks are redundant
      */
     @Overwrite
-    public void enqueueRelightChecks() {
-        // no-op: Supernova handles all light propagation
-    }
+    public void enqueueRelightChecks() {}
 
     @Inject(method = "onChunkUnload", at = @At("HEAD"))
     private void supernova$onChunkUnload(CallbackInfo ci) {
@@ -349,12 +363,17 @@ public abstract class MixinChunk implements SupernovaChunk {
         final WorldLightManager iface = ((SupernovaWorld) this.worldObj).supernova$getLightManager();
         if (iface == null) return;
 
-        iface.removeChunkFromQueues(this.xPosition, this.zPosition);
-
+        // Await before dropping the queues; removal completes the futures and makes the wait a no-op.
         if (!this.worldObj.isRemote) {
-            iface.awaitPendingWork(this.xPosition, this.zPosition);
+            final boolean settled = iface.awaitPendingWork(this.xPosition, this.zPosition);
+            if (!settled || iface.hasUnsettledLightValues(this.xPosition, this.zPosition)) {
+                this.supernova$lightReady = false;
+                this.supernova$lightUsable = false;
+            }
         }
 
+        iface.removeChunkFromQueues(this.xPosition, this.zPosition);
+        // Last: workers key "chunk unloaded" off the loaded map, so an earlier unregister lets them bail.
         iface.unregisterChunk(this.xPosition, this.zPosition);
     }
 
@@ -370,9 +389,8 @@ public abstract class MixinChunk implements SupernovaChunk {
         return ChunkLightHelper.getBlockLight(this.supernova$blockNibblesR, this.supernova$blockNibblesG, this.supernova$blockNibblesB, x, y, z);
     }
 
-    // Our engine manages all light nibbles directly -- ignore external writes.
+    // Engine owns the nibbles; MixinWorld already intercepts updateLightByType.
     // @Inject+cancel instead of @Overwrite for compat with mods injecting into this method.
-    // Effectively dead code -- MixinWorld intercepts updateLightByType before it reaches here, but better to be safe.
     @Inject(method = "setLightValue", at = @At("HEAD"), cancellable = true)
     private void supernova$setLightValue(EnumSkyBlock type, int x, int y, int z, int value, CallbackInfo ci) {
         ci.cancel();
@@ -380,17 +398,23 @@ public abstract class MixinChunk implements SupernovaChunk {
 
     @Unique private static final String SET_BLOCK = "func_150807_a(IIILnet/minecraft/block/Block;I)Z";
 
-    // Prevent generateSkylightMap from being called when a new section is created.
+    /** Suppresses generateSkylightMap; targeted store sits in the just-allocated-section branch, and a section born under a final nibble ships zeros unless seeded. */
     @ModifyVariable(method = SET_BLOCK, at = @At(value = "STORE", ordinal = 1), name = "flag", index = 11, allow = 1)
-    private boolean supernova$preventSkylightRegen(boolean flag) {
+    private boolean supernova$onSectionCreated(boolean flag, int x, int y, int z, Block block, int meta) {
+        final int sectionY = y >> 4;
+        ChunkLightHelper.seedVanillaSection(this.storageArrays[sectionY], this.supernova$skyNibbles, this.supernova$skyNibblesG, this.supernova$skyNibblesB,
+            this.supernova$blockNibblesR, this.supernova$blockNibblesG, this.supernova$blockNibblesB, sectionY);
+        if (this.worldObj != null) {
+            final WorldLightManager iface = ((SupernovaWorld) this.worldObj).supernova$getLightManager();
+            // The emptiness map still believes this section is empty; nothing else told the engine otherwise.
+            if (iface != null) iface.queueSectionChange(this.xPosition, sectionY, this.zPosition, false);
+        }
         return false;
     }
 
-    // No-op propagateSkylightOcclusion -- it sets dirty flags for recheckGaps which is already overwritten to no-op by Supernova.
+    // It only sets dirty flags for recheckGaps, already overwritten to a no-op.
     @Redirect(method = SET_BLOCK, at = @At(value = "INVOKE", target = "Lnet/minecraft/world/chunk/Chunk;propagateSkylightOcclusion(II)V"))
-    private void supernova$noPropagateOcclusion(Chunk chunk, int x, int z) {
-        // no-op
-    }
+    private void supernova$noPropagateOcclusion(Chunk chunk, int x, int z) {}
 
     /**
      * @author Supernova
@@ -411,5 +435,11 @@ public abstract class MixinChunk implements SupernovaChunk {
             skyLight = blockLight;
         }
         return skyLight;
+    }
+
+    // Vanilla's renderer and pathfinding ChunkCache use this; only the packet path needs isEmpty()'s light latch.
+    @Redirect(method = "getAreLevelsEmpty", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/chunk/storage/ExtendedBlockStorage;isEmpty()Z"))
+    private boolean supernova$levelsEmptyIgnoresLight(ExtendedBlockStorage section) {
+        return ((ExtendedSection) section).supernova$hasNoBlocks();
     }
 }

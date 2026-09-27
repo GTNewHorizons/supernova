@@ -1,332 +1,436 @@
 package com.mitchej123.supernova.light.engine;
 
-import com.mitchej123.supernova.api.PackedColorLight;
+import com.mitchej123.supernova.api.FaceLightOcclusion;
+import com.mitchej123.supernova.api.ColoredLightSource;
+import com.mitchej123.supernova.api.LightColorRegistry;
+import com.mitchej123.supernova.light.engine.MCBootstrap.TestIds;
+import net.minecraft.block.Block;
+import net.minecraft.block.material.Material;
 import net.minecraft.init.Blocks;
+import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
+import net.minecraftforge.common.util.ForgeDirection;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.TestInstance.Lifecycle;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 
 import static com.mitchej123.supernova.api.PackedColorLight.blue;
 import static com.mitchej123.supernova.api.PackedColorLight.green;
 import static com.mitchej123.supernova.api.PackedColorLight.pack;
 import static com.mitchej123.supernova.api.PackedColorLight.red;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BlockEngineBFSTest {
 
-    private TestableBlockEngine engine;
+    public static class GreenLamp extends Block implements ColoredLightSource {
+        public GreenLamp() {super(Material.rock);}
 
-    @BeforeAll
-    static void bootstrap() {
-        MCBootstrap.init();
+        @Override
+        public int getColoredLightEmission(final int meta) {return pack(0, 15, 0);}
     }
 
-    @BeforeEach
-    void setup() {
-        engine = new TestableBlockEngine(MCBootstrap.getServerWorld());
-        BFSTestHelper.setupCenter(engine);
-        // Populate center chunk section at Y=4 (world Y 64-79)
-        BFSTestHelper.populateAirSection(engine, 0, 4, 0);
+    enum EngineKind {
+        BLOCK {
+            @Override
+            RGBEngineAccess create() {
+                return new TestableBlockEngine(MCBootstrap.getServerWorld());
+            }
+        },
+        SKY {
+            @Override
+            RGBEngineAccess create() {
+                return new TestableSkyEngine(MCBootstrap.getServerWorld());
+            }
+        };
+
+        abstract RGBEngineAccess create();
     }
 
-    @Test
-    void testSingleWhiteEmitterFalloff() {
-        // Populate adjacent chunk sections so light can propagate past chunk boundaries
-        BFSTestHelper.populateAirSection(engine, 1, 4, 0);
-        BFSTestHelper.populateAirSection(engine, -1, 4, 0);
-        BFSTestHelper.populateAirSection(engine, 0, 4, 1);
-        BFSTestHelper.populateAirSection(engine, 0, 4, -1);
-        BFSTestHelper.populateAirSection(engine, 0, 5, 0);
-        BFSTestHelper.populateAirSection(engine, 0, 3, 0);
+    private static RGBEngineAccess centered(EngineKind kind) {
+        return BFSTestHelper.centeredWithAir(kind.create());
+    }
 
-        // White light at (8,68,8), verify diamond falloff
-        BFSTestHelper.enqueueIncrease(engine, 8, 68, 8, 15, 15, 15);
-        engine.callPerformLightIncrease();
-
-        // Source position should be 15
-        assertLight(8, 68, 8, 15, 15, 15);
-
-        // Adjacent (distance 1) = 14
-        assertLight(9, 68, 8, 14, 14, 14);
-        assertLight(7, 68, 8, 14, 14, 14);
-        assertLight(8, 69, 8, 14, 14, 14);
-        assertLight(8, 67, 8, 14, 14, 14);
-        assertLight(8, 68, 9, 14, 14, 14);
-        assertLight(8, 68, 7, 14, 14, 14);
-
-        // Distance 2 = 13
-        assertLight(10, 68, 8, 13, 13, 13);
-        assertLight(8, 70, 8, 13, 13, 13);
-
-        // Distance 14 = 1 (should still exist)
-        assertLight(8 + 14, 68, 8, 1, 1, 1);
-
-        // Distance 15 = 0 (below threshold, not propagated)
-        assertLight(8 + 15, 68, 8, 0, 0, 0);
+    private static TestableBlockEngine neighborhoodEngine() {
+        return BFSTestHelper.centeredNeighborhood(new TestableBlockEngine(MCBootstrap.getServerWorld()));
     }
 
     @Test
-    void testSingleColoredEmitter() {
-        // Pure red light at (8,68,8)
-        BFSTestHelper.enqueueIncrease(engine, 8, 68, 8, 15, 0, 0);
-        engine.callPerformLightIncrease();
+    void sectionPackingKeepsGreenAndBlueWhenRedHasNoStorage() {
+        final TestableBlockEngine engine = neighborhoodEngine();
+        final int section = BFSTestHelper.sectionIndex(engine, 0, 4, 0);
+        final int local = BFSTestHelper.localIndex(15, 68, 8);
+        engine.getNibbleCacheG()[section].set(local, 12);
+        engine.getNibbleCacheB()[section].set(local, 8);
 
-        assertLight(8, 68, 8, 15, 0, 0);
-        assertLight(9, 68, 8, 14, 0, 0);
-        assertLight(10, 68, 8, 13, 0, 0);
-
-        // Green and blue stay zero everywhere
-        for (int d = 0; d <= 14; d++) {
-            int light = BFSTestHelper.getLight(engine, 8 + d, 68, 8);
-            assertEquals(0, green(light), "green at distance " + d);
-            assertEquals(0, blue(light), "blue at distance " + d);
-        }
+        assertEquals(pack(0, 12, 8), engine.packSection(section)[local]);
     }
 
     @Test
-    void testOpaqueBlockBlocking() {
-        // Light at (8,68,8), stone wall at x=10
-        BFSTestHelper.setBlock(engine, 10, 68, 8, Blocks.stone);
-        BFSTestHelper.enqueueIncrease(engine, 8, 68, 8, 15, 15, 15);
-        engine.callPerformLightIncrease();
+    void edgeCheckPropagatesGreenLightWithUninitialisedRed() {
+        final TestableBlockEngine engine = neighborhoodEngine();
+        final Block lamp = MCBootstrap.registerTestBlock(TestIds.GREEN_EDGE_LAMP, "green_edge_lamp", GreenLamp.class, 0, false, 0);
+        BFSTestHelper.setBlock(engine, 15, 68, 8, lamp);
+        final int section = BFSTestHelper.sectionIndex(engine, 0, 4, 0);
+        engine.getNibbleCacheG()[section].set(BFSTestHelper.localIndex(15, 68, 8), 15);
 
-        // Light reaches x=9 (distance 1 from stone)
-        assertLight(9, 68, 8, 14, 14, 14);
-
-        assertLight(10, 68, 8, 0, 0, 0);
-
-        // Behind stone -- light goes around via adjacent air blocks (shortest path = 5 steps)
-        // Path: (8,68,8)->(9,68,8)->(9,68,9)->(10,68,9)->(11,68,9)->(11,68,8) = level 10
-        assertLight(11, 68, 8, 10, 10, 10);
-
-        // Light goes around stone in other directions
-        assertTrue(red(BFSTestHelper.getLight(engine, 8, 68, 10)) > 0, "light should go +Z");
-        assertTrue(red(BFSTestHelper.getLight(engine, 8, 69, 8)) > 0, "light should go +Y");
-    }
-
-    @Test
-    void testPropagationStopsAtThreshold() {
-        // Light level 2: should propagate one step to level 1, then stop
-        BFSTestHelper.enqueueIncrease(engine, 8, 68, 8, 2, 0, 0);
-        engine.callPerformLightIncrease();
-
-        assertLight(8, 68, 8, 2, 0, 0);
-        assertLight(9, 68, 8, 1, 0, 0);
-        // Level 1 doesn't propagate further (maxComponent(1) <= 1)
-        assertLight(10, 68, 8, 0, 0, 0);
-    }
-
-    @Test
-    void testTwoEmittersDifferentColors() {
-        // Red at (4,68,8), blue at (12,68,8)
-        BFSTestHelper.enqueueIncrease(engine, 4, 68, 8, 15, 0, 0);
-        BFSTestHelper.enqueueIncrease(engine, 12, 68, 8, 0, 0, 15);
-        engine.callPerformLightIncrease();
-
-        // At midpoint (8,68,8): red attenuated by 4, blue attenuated by 4
-        int mid = BFSTestHelper.getLight(engine, 8, 68, 8);
-        assertEquals(11, red(mid), "red at midpoint");
-        assertEquals(0, green(mid), "green at midpoint");
-        assertEquals(11, blue(mid), "blue at midpoint");
-
-        // Near red source: dominated by red
-        int nearRed = BFSTestHelper.getLight(engine, 5, 68, 8);
-        assertEquals(14, red(nearRed));
-        assertEquals(0, green(nearRed));
-        assertTrue(blue(nearRed) < 10, "blue should be weak near red source");
-    }
-
-    @Test
-    void testTwoEmittersOverlapMax() {
-        // Two white sources close together -- verify packedMax behavior
-        BFSTestHelper.enqueueIncrease(engine, 7, 68, 8, 15, 15, 15);
-        BFSTestHelper.enqueueIncrease(engine, 9, 68, 8, 15, 15, 15);
-        engine.callPerformLightIncrease();
-
-        // At (8,68,8): distance 1 from both -> 14 from each -> max = 14
-        assertLight(8, 68, 8, 14, 14, 14);
-
-        // At (7,68,8): distance 0 from first = 15, distance 2 from second = 13 -> max = 15
-        assertLight(7, 68, 8, 15, 15, 15);
-    }
-
-    @Test
-    void testDecreaseRemovesAllLight() {
-        // Set up lit state: source at (8,68,8) with level 15
-        BFSTestHelper.enqueueIncrease(engine, 8, 68, 8, 15, 15, 15);
-        engine.callPerformLightIncrease();
-
-        // Verify light exists
-        assertTrue(red(BFSTestHelper.getLight(engine, 10, 68, 8)) > 0);
-
-        // Now remove: clear source and enqueue decrease
-        BFSTestHelper.setLight(engine, 8, 68, 8, 0, 0, 0);
-        BFSTestHelper.enqueueDecrease(engine, 8, 68, 8, 15, 15, 15);
+        engine.callCheckChunkEdge(0, 4, 0);
         engine.callPerformLightDecrease();
 
-        // All light should be gone
-        for (int d = 0; d <= 14; d++) {
-            assertLight(8 + d, 68, 8, 0, 0, 0);
-            assertLight(8 - d, 68, 8, 0, 0, 0);
+        assertEquals(14, green(engine.getLightAt(16, 68, 8)));
+        assertEquals(0, red(engine.getLightAt(16, 68, 8)));
+    }
+
+    @ParameterizedTest
+    @EnumSource(EngineKind.class)
+    void singleSourceFalloffToRangeEnd(EngineKind kind) {
+        final RGBEngineAccess e = BFSTestHelper.centeredNeighborhood(kind.create());
+        BFSTestHelper.enqueueIncrease(e, 8, 68, 8, 15, 0, 0);
+        e.callPerformLightIncrease();
+
+        for (int d = 0; d <= 15; d++) {
+            assertLight(e, 8 + d, 68, 8, 15 - d, 0, 0);
         }
+        assertLight(e, 8, 69, 8, 14, 0, 0);
+        assertLight(e, 8, 67, 8, 14, 0, 0);
+    }
+
+    @ParameterizedTest
+    @EnumSource(EngineKind.class)
+    void opaqueBlockBlocksAndLightRoutesAround(EngineKind kind) {
+        final RGBEngineAccess e = centered(kind);
+        BFSTestHelper.setBlock(e, 10, 68, 8, Blocks.stone);
+        BFSTestHelper.enqueueIncrease(e, 8, 68, 8, 15, 15, 15);
+        e.callPerformLightIncrease();
+
+        assertLight(e, 9, 68, 8, 14, 14, 14);
+        assertLight(e, 10, 68, 8, 0, 0, 0);
+        // Shortest detour around the stone is 5 steps.
+        assertLight(e, 11, 68, 8, 10, 10, 10);
+        assertTrue(red(BFSTestHelper.getLight(e, 8, 68, 10)) > 0, "light should go +Z");
+        assertTrue(red(BFSTestHelper.getLight(e, 8, 69, 8)) > 0, "light should go +Y");
+    }
+
+    @ParameterizedTest
+    @EnumSource(EngineKind.class)
+    void nullNibbleIsSkipped(EngineKind kind) {
+        final RGBEngineAccess e = centered(kind);
+        // Section 5 is unpopulated.
+        BFSTestHelper.enqueueIncrease(e, 8, 78, 8, 15, 15, 15);
+        e.callPerformLightIncrease();
+
+        assertLight(e, 8, 78, 8, 15, 15, 15);
+        assertLight(e, 8, 77, 8, 14, 14, 14);
+    }
+
+    @ParameterizedTest
+    @EnumSource(EngineKind.class)
+    void lightCrossesSectionBoundary(EngineKind kind) {
+        final RGBEngineAccess e = centered(kind);
+        BFSTestHelper.populateAirSection(e, 0, 5, 0);
+
+        BFSTestHelper.enqueueIncrease(e, 8, 79, 8, 15, 15, 15);
+        e.callPerformLightIncrease();
+
+        assertLight(e, 8, 79, 8, 15, 15, 15);
+        assertLight(e, 8, 78, 8, 14, 14, 14);
+        assertLight(e, 8, 80, 8, 14, 14, 14);
+        assertLight(e, 8, 81, 8, 13, 13, 13);
     }
 
     @Test
-    void testDecreaseWithSurvivingSource() {
-        // Two sources: A at (4,68,8) and B at (12,68,8), both white
-        BFSTestHelper.enqueueIncrease(engine, 4, 68, 8, 15, 15, 15);
-        BFSTestHelper.enqueueIncrease(engine, 12, 68, 8, 15, 15, 15);
-        engine.callPerformLightIncrease();
+    void nullSectionTreatedAsAir() {
+        final TestableBlockEngine engine = BFSTestHelper.centeredWithAir(new TestableBlockEngine(MCBootstrap.getServerWorld()));
+        engine.getSectionCache()[BFSTestHelper.sectionIndex(engine, 0, 4, 0)] = null;
 
-        // Remove source A: clear its light and enqueue decrease
-        BFSTestHelper.setLight(engine, 4, 68, 8, 0, 0, 0);
-        BFSTestHelper.enqueueDecrease(engine, 4, 68, 8, 15, 15, 15);
-        engine.callPerformLightDecrease();
-
-        // Source B should be intact
-        assertLight(12, 68, 8, 15, 15, 15);
-        assertLight(11, 68, 8, 14, 14, 14);
-        assertLight(13, 68, 8, 14, 14, 14);
-
-        // Source A position should now only have light from B (distance 8 -> level 7)
-        int atA = BFSTestHelper.getLight(engine, 4, 68, 8);
-        assertEquals(7, red(atA), "light from surviving source B");
-    }
-
-
-    @Test
-    void testNullNibbleSkipped() {
-        // Don't populate section at sectionY=5 (world Y 80-95)
-        // Light at (8,78,8) near top of section 4 -- should not crash when trying to enter section 5
-        BFSTestHelper.enqueueIncrease(engine, 8, 78, 8, 15, 15, 15);
-        engine.callPerformLightIncrease();
-
-        // Light propagates within section 4
-        assertLight(8, 78, 8, 15, 15, 15);
-        assertLight(8, 77, 8, 14, 14, 14);
-        // Does not crash trying to enter section 5 (no nibble -> skipped)
-    }
-
-    @Test
-    void testNullSectionTreatedAsAir() {
-        // Remove the section from cache but keep nibbles
-        // This simulates a section with nibbles but no block storage
-        int idx = BFSTestHelper.sectionIndex(engine, 0, 4, 0);
-        engine.getSectionCache()[idx] = null;
-
-        // Nibbles are still there from setup -- engine should treat null section as air
         BFSTestHelper.enqueueIncrease(engine, 8, 68, 8, 15, 15, 15);
         engine.callPerformLightIncrease();
 
-        // Should propagate with air absorption (1,1,1 per step)
-        assertLight(8, 68, 8, 15, 15, 15);
-        assertLight(9, 68, 8, 14, 14, 14);
+        assertLight(engine, 8, 68, 8, 15, 15, 15);
+        assertLight(engine, 9, 68, 8, 14, 14, 14);
     }
 
     @Test
-    void testSectionBoundaryCrossing() {
-        // Populate section 5 (Y 80-95) adjacent to section 4
-        BFSTestHelper.populateAirSection(engine, 0, 5, 0);
+    void decreaseMultiColorDoesNotExplode() {
+        final TestableBlockEngine engine = neighborhoodEngine();
 
-        // Light near top of section 4
-        BFSTestHelper.enqueueIncrease(engine, 8, 79, 8, 15, 15, 15);
-        engine.callPerformLightIncrease();
-
-        // Light in section 4
-        assertLight(8, 79, 8, 15, 15, 15);
-        assertLight(8, 78, 8, 14, 14, 14);
-
-        // Light crosses into section 5
-        assertLight(8, 80, 8, 14, 14, 14);
-        assertLight(8, 81, 8, 13, 13, 13);
-    }
-
-    @Test
-    void testDecreaseMultiColorDoesNotExplode() {
-        // Set up 3 differently-colored sources in a small area to create multi-channel overlap.
-        // This is the scenario that caused BFS explosion: overlapping colors mean the decrease
-        // for one source's channel cascades through blocks where that channel was already zero.
-        BFSTestHelper.populateAirSection(engine, 1, 4, 0);
-        BFSTestHelper.populateAirSection(engine, -1, 4, 0);
-        BFSTestHelper.populateAirSection(engine, 0, 4, 1);
-        BFSTestHelper.populateAirSection(engine, 0, 4, -1);
-        BFSTestHelper.populateAirSection(engine, 0, 5, 0);
-        BFSTestHelper.populateAirSection(engine, 0, 3, 0);
-
-        // Red at (4,68,8), green at (8,68,4), blue at (12,68,8)
         BFSTestHelper.enqueueIncrease(engine, 4, 68, 8, 15, 0, 0);
         BFSTestHelper.enqueueIncrease(engine, 8, 68, 4, 0, 15, 0);
         BFSTestHelper.enqueueIncrease(engine, 12, 68, 8, 0, 0, 15);
         engine.callPerformLightIncrease();
 
-        // Now remove the red source
         BFSTestHelper.setLight(engine, 4, 68, 8, 0, 0, 0);
         BFSTestHelper.enqueueDecrease(engine, 4, 68, 8, 15, 0, 0);
         engine.lastBfsDecreaseTotal = 0;
         engine.lastBfsIncreaseTotal = 0;
         engine.callPerformLightDecrease();
 
-        // Red should be gone everywhere its range reached
         for (int d = 0; d <= 14; d++) {
-            int light = BFSTestHelper.getLight(engine, 4 + d, 68, 8);
-            assertEquals(0, red(light), "red should be cleared at distance " + d);
+            assertEquals(0, red(BFSTestHelper.getLight(engine, 4 + d, 68, 8)), "red should be cleared at distance " + d);
         }
 
-        // Green and blue sources should be intact (may have spillover from each other)
         assertEquals(0, red(BFSTestHelper.getLight(engine, 8, 68, 4)), "red at green source");
         assertEquals(15, green(BFSTestHelper.getLight(engine, 8, 68, 4)), "green at green source");
         assertEquals(0, red(BFSTestHelper.getLight(engine, 12, 68, 8)), "red at blue source");
         assertEquals(15, blue(BFSTestHelper.getLight(engine, 12, 68, 8)), "blue at blue source");
 
-        // BFS should be bounded: a single red source at level 15 in open air affects a sphere
-        // of radius 15. With the revisit fix, the decrease visits each block at most once per
-        // channel (only R is non-zero in the decrease path). Volume of a diamond/Manhattan
-        // radius 15 is at most ~15000 blocks. Allow generous margin for BFS overhead.
-        assertTrue(engine.lastBfsDecreaseTotal < 30_000,
-            "decrease BFS should be bounded, was: " + engine.lastBfsDecreaseTotal);
+        // Radius-15 Manhattan ball is ~15k cells.
+        assertTrue(engine.lastBfsDecreaseTotal < 30_000, "decrease BFS should be bounded, was: " + engine.lastBfsDecreaseTotal);
+    }
+
+    /** Opaque only on +Y. */
+    private static final class UpOccluder extends Block implements FaceLightOcclusion {
+
+        private UpOccluder() {
+            super(Material.rock);
+        }
+
+        @Override
+        public int getDirectionalLightOpacity(int meta, ForgeDirection direction) {
+            return direction == ForgeDirection.UP ? 255 : 0;
+        }
     }
 
     @Test
-    void testDecreaseWithDifferentColorSurvival() {
-        // Red source at (4,68,8), blue source at (12,68,8).
-        // Remove red. Blue must survive untouched -- the decrease for red should not
-        // cascade through blue-only channels.
-        BFSTestHelper.populateAirSection(engine, 1, 4, 0);
-        BFSTestHelper.populateAirSection(engine, -1, 4, 0);
-        BFSTestHelper.populateAirSection(engine, 0, 4, 1);
-        BFSTestHelper.populateAirSection(engine, 0, 4, -1);
-        BFSTestHelper.populateAirSection(engine, 0, 5, 0);
-        BFSTestHelper.populateAirSection(engine, 0, 3, 0);
+    void faceOcclusionImplementorGatesSourceFaces() {
+        final Block occluder = MCBootstrap.registerTestBlock(TestIds.FACE_OCCLUDER, "test_face_occluder", UpOccluder.class, 255, false, 0);
+        FaceOcclusion.registerDefaults();
 
-        BFSTestHelper.enqueueIncrease(engine, 4, 68, 8, 15, 0, 0);
-        BFSTestHelper.enqueueIncrease(engine, 12, 68, 8, 0, 0, 15);
-        engine.callPerformLightIncrease();
+        final int id = Block.getIdFromBlock(occluder);
+        assertTrue(FaceOcclusion.hasSidedTransparency(id), "implementor must be marked sided");
+        assertNull(FaceOcclusion.sidedFaceBits(id), "implementor must get no faceSolidity row");
 
-        // Verify overlap zone has both colors
-        int mid = BFSTestHelper.getLight(engine, 8, 68, 8);
-        assertEquals(11, red(mid), "red at midpoint before decrease");
-        assertEquals(11, blue(mid), "blue at midpoint before decrease");
+        final RGBEngineAccess e = centered(EngineKind.BLOCK);
+        BFSTestHelper.setBlock(e, 8, 68, 8, occluder);
+        // Boxes in the cell above so its only unblocked neighbor is the occluder's +Y face.
+        BFSTestHelper.setBlock(e, 7, 69, 8, Blocks.stone);
+        BFSTestHelper.setBlock(e, 9, 69, 8, Blocks.stone);
+        BFSTestHelper.setBlock(e, 8, 69, 7, Blocks.stone);
+        BFSTestHelper.setBlock(e, 8, 69, 9, Blocks.stone);
+        BFSTestHelper.setBlock(e, 8, 70, 8, Blocks.stone);
 
-        // Remove red source
-        BFSTestHelper.setLight(engine, 4, 68, 8, 0, 0, 0);
-        BFSTestHelper.enqueueDecrease(engine, 4, 68, 8, 15, 0, 0);
-        engine.callPerformLightDecrease();
+        BFSTestHelper.enqueueIncrease(e, 8, 68, 8, 15, 15, 15);
+        e.callPerformLightIncrease();
 
-        // Midpoint should have blue only now
-        mid = BFSTestHelper.getLight(engine, 8, 68, 8);
-        assertEquals(0, red(mid), "red cleared at midpoint");
-        assertEquals(11, blue(mid), "blue preserved at midpoint");
-
-        // Blue source intact
-        assertLight(12, 68, 8, 0, 0, 15);
-        assertLight(11, 68, 8, 0, 0, 14);
+        assertLight(e, 8, 69, 8, 0, 0, 0);
+        assertLight(e, 9, 68, 8, 14, 14, 14);
+        assertLight(e, 8, 67, 8, 14, 14, 14);
     }
 
-    private void assertLight(int x, int y, int z, int expectedR, int expectedG, int expectedB) {
-        int light = BFSTestHelper.getLight(engine, x, y, z);
+    static void assertLight(RGBEngineAccess engine, int x, int y, int z, int expectedR, int expectedG, int expectedB) {
+        final int light = BFSTestHelper.getLight(engine, x, y, z);
         assertEquals(expectedR, red(light), "R at (" + x + "," + y + "," + z + ")");
         assertEquals(expectedG, green(light), "G at (" + x + "," + y + "," + z + ")");
         assertEquals(expectedB, blue(light), "B at (" + x + "," + y + "," + z + ")");
+    }
+
+    @Nested
+    @TestInstance(Lifecycle.PER_CLASS)
+    class EmitterScan {
+
+        private Block lamp;
+        private Block lampRemap;
+        private Block lampNeg;
+
+        @BeforeAll
+        void registerProbes() {
+            lamp = MCBootstrap.registerTestBlock(TestIds.LAMP, "test_lamp", Block.class, 0, false, 0);
+            LightColorRegistry.register(lamp, 13, 15, 0, 0);
+
+            lampRemap = MCBootstrap.registerTestBlock(TestIds.LAMP_REMAP, "test_lamp_remap", Block.class, 0, false, 0);
+            LightColorRegistry.register(lampRemap, 13, 15, 0, 15);
+            MCBootstrap.rebindBlock(TestIds.LAMP_REMAP_TARGET, "test_lamp_remap", lampRemap);
+            LightColorRegistry.rebuildIdMappings();
+
+            lampNeg = MCBootstrap.registerTestBlock(TestIds.LAMP_NEG, "test_lamp_neg", Block.class, 0, false, 0);
+            LightColorRegistry.register(lampNeg, 13, 0, 15, 0);
+        }
+
+        private TestableBlockEngine engine;
+
+        @BeforeEach
+        void setup() {
+            engine = neighborhoodEngine();
+        }
+
+        @Test
+        void lightChunkScanFindsZeroBaseLightRegisteredEmitter() {
+            assertEquals(0, lamp.getLightValue(), "test block must have zero base light value");
+            assertTrue(LightColorRegistry.hasExplicitEntry(lamp));
+
+            final Chunk chunk = chunkWithLampAt(engine, 8, 56, 8, lamp, 13);
+
+            engine.callLightChunk(chunk, false);
+
+            assertEquals(pack(15, 0, 0), BFSTestHelper.getLight(engine, 8, 56, 8) & 0x0F0F0F, "emitter cell");
+            assertEquals(pack(14, 0, 0), BFSTestHelper.getLight(engine, 9, 56, 8) & 0x0F0F0F, "adjacent cell");
+        }
+
+        @Test
+        void lightChunkScanFindsEmitterAfterIdRemap() {
+            assertTrue(LightColorRegistry.hasExplicitEntry(lampRemap), "entry must survive the remap");
+
+            final Chunk chunk = chunkWithLampAt(engine, 8, 56, 8, lampRemap, 13);
+
+            engine.callLightChunk(chunk, false);
+
+            assertEquals(pack(15, 0, 15), BFSTestHelper.getLight(engine, 8, 56, 8) & 0x0F0F0F, "emitter cell after remap");
+            assertEquals(pack(14, 0, 14), BFSTestHelper.getLight(engine, 9, 56, 8) & 0x0F0F0F, "adjacent cell after remap");
+        }
+
+        @Test
+        void lightChunkScanFindsEmitterInNegativeCoordChunk() {
+            assertTrue(LightColorRegistry.hasExplicitEntry(lampNeg));
+
+            final TestableBlockEngine negEngine = new TestableBlockEngine(MCBootstrap.getServerWorld());
+            negEngine.callSetupEncodeOffset(-21 * 16 + 7, 64, -35 * 16 + 7);
+            BFSTestHelper.populateNeighborhood(negEngine, -22, -20, -36, -34, 2, 4);
+
+            final Chunk chunk = chunkWithLampAt(negEngine, -326, 56, -554, lampNeg, 13);
+
+            negEngine.callLightChunk(chunk, false);
+
+            assertEquals(pack(0, 15, 0), BFSTestHelper.getLight(negEngine, -326, 56, -554) & 0x0F0F0F, "emitter cell");
+            assertEquals(pack(0, 14, 0), BFSTestHelper.getLight(negEngine, -325, 56, -554) & 0x0F0F0F, "adjacent cell");
+        }
+
+        /** Shares the engine cache's section object, which lightChunk scans. */
+        private Chunk chunkWithLampAt(TestableBlockEngine engine, int worldX, int worldY, int worldZ, Block lamp, int meta) {
+            final Chunk chunk = new Chunk(MCBootstrap.getServerWorld(), worldX >> 4, worldZ >> 4);
+            final ExtendedBlockStorage section = engine.getSectionCache()[BFSTestHelper.sectionIndex(engine, worldX >> 4, worldY >> 4, worldZ >> 4)];
+            section.func_150818_a(worldX & 15, worldY & 15, worldZ & 15, lamp);
+            section.setExtBlockMetadata(worldX & 15, worldY & 15, worldZ & 15, meta);
+            chunk.getBlockStorageArray()[worldY >> 4] = section;
+            return chunk;
+        }
+    }
+
+    @Nested
+    class InitialLight {
+
+        private static final int ORANGE_R = 15, ORANGE_G = 12, ORANGE_B = 10;
+
+        private TestableBlockEngine engine;
+        private Chunk centerChunk;
+
+        @BeforeEach
+        void setup() {
+            engine = neighborhoodEngine();
+            centerChunk = new Chunk(MCBootstrap.getServerWorld(), 0, 0);
+        }
+
+        private void runCenterInitialLightFlow() {
+            engine.callPropagateNeighbourLevels(centerChunk, 3, 5);
+            engine.callPerformLightIncrease();
+        }
+
+        private int countHueViolations(int minX, int maxX, int minZ, int maxZ) {
+            int count = 0;
+            for (int x = minX; x <= maxX; x++) {
+                for (int y = 48; y <= 95; y++) {
+                    for (int z = minZ; z <= maxZ; z++) {
+                        final int light = BFSTestHelper.getLight(engine, x, y, z);
+                        if (green(light) > red(light) || blue(light) > green(light)) count++;
+                    }
+                }
+            }
+            return count;
+        }
+
+        /** Seeds are not hue-ordered and sit 22 apart, out of each other's reach. */
+        @Test
+        void neighborBorderSeedsEachChannelIndependently() {
+            BFSTestHelper.setLight(engine, -1, 68, 8, 2, 3, 0);
+            BFSTestHelper.setLight(engine, -1, 52, 2, 8, 10, 0);
+
+            runCenterInitialLightFlow();
+
+            assertLight(engine, 0, 68, 8, 1, 2, 0);
+            assertLight(engine, 1, 68, 8, 0, 1, 0);
+            assertLight(engine, 0, 67, 8, 0, 1, 0);
+            assertLight(engine, 0, 69, 8, 0, 1, 0);
+            assertLight(engine, 0, 68, 7, 0, 1, 0);
+            assertLight(engine, 0, 68, 9, 0, 1, 0);
+            assertLight(engine, 2, 68, 8, 0, 0, 0);
+
+            assertLight(engine, 0, 52, 2, 7, 9, 0);
+            assertLight(engine, 5, 52, 2, 2, 4, 0);
+            assertLight(engine, 8, 52, 2, 0, 1, 0);
+            assertLight(engine, 9, 52, 2, 0, 0, 0);
+        }
+
+        @Test
+        void poolPlusLegalNeighborSeedingKeepsHueOrderingAndExactField() {
+            final int srcX = -8, srcY = 68, srcZ = 8;
+            for (int x = -16; x <= -1; x++) {
+                for (int y = 54; y <= 82; y++) {
+                    for (int z = 0; z <= 15; z++) {
+                        final int d = Math.abs(x - srcX) + Math.abs(y - srcY) + Math.abs(z - srcZ);
+                        final int r = Math.max(ORANGE_R - d, 0);
+                        final int g = Math.max(ORANGE_G - d, 0);
+                        final int b = Math.max(ORANGE_B - d, 0);
+                        if ((r | g | b) != 0) BFSTestHelper.setLight(engine, x, y, z, r, g, b);
+                    }
+                }
+            }
+
+            for (int px = 6; px <= 11; px++) {
+                for (int pz = 6; pz <= 11; pz++) {
+                    BFSTestHelper.enqueueIncrease(engine, px, 68, pz, ORANGE_R, ORANGE_G, ORANGE_B);
+                }
+            }
+
+            runCenterInitialLightFlow();
+
+            for (int x = 0; x <= 15; x++) {
+                for (int y = 48; y <= 95; y++) {
+                    for (int z = 0; z <= 15; z++) {
+                        final int dWest = Math.abs(x - srcX) + Math.abs(y - srcY) + Math.abs(z - srcZ);
+                        final int dx = Math.max(Math.max(6 - x, x - 11), 0);
+                        final int dz = Math.max(Math.max(6 - z, z - 11), 0);
+                        final int dPool = dx + Math.abs(y - 68) + dz;
+                        final int expR = Math.max(Math.max(ORANGE_R - dWest, ORANGE_R - dPool), 0);
+                        final int expG = Math.max(Math.max(ORANGE_G - dWest, ORANGE_G - dPool), 0);
+                        final int expB = Math.max(Math.max(ORANGE_B - dWest, ORANGE_B - dPool), 0);
+                        assertLight(engine, x, y, z, expR, expG, expB);
+                    }
+                }
+            }
+        }
+
+        @Test
+        void lowLevelMergeWritesWithoutReenqueueStaysExact() {
+            BFSTestHelper.enqueueIncrease(engine, 8, 68, 8, 2, 0, 0);
+            BFSTestHelper.enqueueIncrease(engine, 9, 68, 8, 0, 1, 0);
+            engine.callPerformLightIncrease();
+
+            assertLight(engine, 9, 68, 8, 1, 1, 0);
+            assertLight(engine, 7, 68, 8, 1, 0, 0);
+            assertLight(engine, 8, 68, 9, 1, 0, 0);
+            assertLight(engine, 8, 68, 7, 1, 0, 0);
+            assertLight(engine, 8, 67, 8, 1, 0, 0);
+            assertLight(engine, 8, 69, 8, 1, 0, 0);
+            assertLight(engine, 10, 68, 8, 0, 0, 0);
+            assertEquals(pack(2, 0, 0), BFSTestHelper.getLight(engine, 8, 68, 8) & 0x0F0F0F);
+        }
+
+        @Test
+        void thresholdBorderValuesSeedExactlyOrNotAtAll() {
+            BFSTestHelper.setLight(engine, -1, 68, 4, 2, 2, 1);
+            BFSTestHelper.setLight(engine, -1, 68, 12, 1, 1, 1);
+
+            runCenterInitialLightFlow();
+
+            assertLight(engine, 0, 68, 4, 1, 1, 0);
+            assertLight(engine, 1, 68, 4, 0, 0, 0);
+            assertLight(engine, 0, 68, 12, 0, 0, 0);
+            assertEquals(0, countHueViolations(-16, 31, -16, 31));
+        }
     }
 }

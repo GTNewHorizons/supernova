@@ -1,6 +1,7 @@
 package com.mitchej123.supernova.light;
 
 import com.mitchej123.supernova.Supernova;
+import com.mitchej123.supernova.config.SupernovaConfig;
 
 import java.io.File;
 import java.io.FileWriter;
@@ -18,12 +19,12 @@ import java.util.concurrent.atomic.AtomicLong;
 public final class LightStats {
 
     private static final int LOG_INTERVAL_TICKS = 20;
-    private static final SimpleDateFormat TIME_FMT = new SimpleDateFormat("HH:mm:ss.SSS");
+    private final SimpleDateFormat timeFmt = new SimpleDateFormat("HH:mm:ss.SSS");
 
     private final String side;
     private final PrintWriter writer;
+    final boolean enabled;
 
-    // Tick tracking
     private long tickCount;
     private long windowStartTick;
 
@@ -34,22 +35,13 @@ public final class LightStats {
     final AtomicLong blockWorkerTimeNs = new AtomicLong();
     final AtomicLong skyTasksProcessed = new AtomicLong();
     final AtomicLong blockTasksProcessed = new AtomicLong();
-    volatile long maxQueueLatencyNs;
-    volatile long totalQueueLatencyNs;
+    final AtomicLong maxQueueLatencyNs = new AtomicLong();
+    final AtomicLong totalQueueLatencyNs = new AtomicLong();
 
     // Backlog snapshots (main thread only)
     volatile int skyBacklog;
     volatile int blockBacklog;
 
-    // Client drain stats (main thread only)
-    long drainedSections;
-    long drainTimeNs;
-    long renderQueueSize;
-
-    // Client sync stats (main thread only)
-    long syncBlockLightCalls;
-    long syncSkyLightCalls;
-    long syncTimeNs;
     public static long engineRenderMarks;
 
     // Budget yield stats (multi-thread write)
@@ -75,21 +67,22 @@ public final class LightStats {
 
     public LightStats(final boolean isClient) {
         this.side = isClient ? "CLIENT" : "SERVER";
+        this.enabled = SupernovaConfig.enableStatsLog;
         PrintWriter pw = null;
-        try {
-            final File logFile = new File("logs/supernova-stats.log");
-            logFile.getParentFile().mkdirs();
-            pw = new PrintWriter(new FileWriter(logFile, true), true);
-        } catch (final IOException e) {
-            Supernova.LOG.error("Failed to open supernova-stats.log", e);
+        if (this.enabled) {
+            try {
+                final File logFile = new File("logs/supernova-stats.log");
+                logFile.getParentFile().mkdirs();
+                pw = new PrintWriter(new FileWriter(logFile, true), true);
+            } catch (final IOException e) {
+                Supernova.LOG.error("Failed to open supernova-stats.log", e);
+            }
         }
         this.writer = pw;
     }
 
-    /**
-     * Called once per tick from the main thread. Triggers periodic dump.
-     */
     public void tick(final int skyBacklog, final int blockBacklog) {
+        if (!this.enabled) return;
         this.skyBacklog = skyBacklog;
         this.blockBacklog = blockBacklog;
         this.tickCount++;
@@ -101,10 +94,8 @@ public final class LightStats {
 
     void recordQueueLatency(final long enqueueTimeNs) {
         final long latency = System.nanoTime() - enqueueTimeNs;
-        if (latency > this.maxQueueLatencyNs) {
-            this.maxQueueLatencyNs = latency;
-        }
-        this.totalQueueLatencyNs += latency;
+        this.maxQueueLatencyNs.accumulateAndGet(latency, Math::max);
+        this.totalQueueLatencyNs.addAndGet(latency);
     }
 
     private void dump() {
@@ -113,7 +104,7 @@ public final class LightStats {
         final long processed = this.chunksProcessed.get();
         final int queued = this.chunksQueued.get();
         final StringBuilder sb = new StringBuilder(256);
-        sb.append(TIME_FMT.format(new Date()));
+        sb.append(this.timeFmt.format(new Date()));
         sb.append(" [").append(this.side).append(']');
         sb.append(" ticks=").append(this.windowStartTick).append('-').append(this.tickCount);
         sb.append(" queued=").append(queued);
@@ -141,11 +132,13 @@ public final class LightStats {
             sb.append(" skyChangeBudgetYields=").append(skyYields);
         }
 
-        if (processed > 0 && this.totalQueueLatencyNs > 0) {
-            sb.append(" avgLatencyMs=").append(String.format(Locale.US, "%.1f", (this.totalQueueLatencyNs / (double) processed) / 1_000_000.0));
+        final long totalLatency = this.totalQueueLatencyNs.get();
+        if (processed > 0 && totalLatency > 0) {
+            sb.append(" avgLatencyMs=").append(String.format(Locale.US, "%.1f", (totalLatency / (double) processed) / 1_000_000.0));
         }
-        if (this.maxQueueLatencyNs > 0) {
-            sb.append(" maxLatencyMs=").append(String.format(Locale.US, "%.1f", this.maxQueueLatencyNs / 1_000_000.0));
+        final long maxLatency = this.maxQueueLatencyNs.get();
+        if (maxLatency > 0) {
+            sb.append(" maxLatencyMs=").append(String.format(Locale.US, "%.1f", maxLatency / 1_000_000.0));
         }
 
         final long edgePairs = this.edgeSectionPairsChecked.get();
@@ -161,12 +154,6 @@ public final class LightStats {
         }
 
         if ("CLIENT".equals(this.side)) {
-            sb.append(" drainedSections=").append(this.drainedSections);
-            sb.append(" drainMs=").append(String.format(Locale.US, "%.1f", this.drainTimeNs / 1_000_000.0));
-            sb.append(" renderQueue=").append(this.renderQueueSize);
-            sb.append(" syncBlock=").append(this.syncBlockLightCalls);
-            sb.append(" syncSky=").append(this.syncSkyLightCalls);
-            sb.append(" syncMs=").append(String.format(Locale.US, "%.1f", this.syncTimeNs / 1_000_000.0));
             sb.append(" engineMarks=").append(engineRenderMarks);
         }
 
@@ -181,14 +168,8 @@ public final class LightStats {
         this.blockWorkerTimeNs.set(0);
         this.skyTasksProcessed.set(0);
         this.blockTasksProcessed.set(0);
-        this.maxQueueLatencyNs = 0;
-        this.totalQueueLatencyNs = 0;
-        this.drainedSections = 0;
-        this.drainTimeNs = 0;
-        this.renderQueueSize = 0;
-        this.syncBlockLightCalls = 0;
-        this.syncSkyLightCalls = 0;
-        this.syncTimeNs = 0;
+        this.maxQueueLatencyNs.set(0);
+        this.totalQueueLatencyNs.set(0);
         engineRenderMarks = 0;
         this.edgeBudgetYields.set(0);
         this.blockChangeBudgetYields.set(0);

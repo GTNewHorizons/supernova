@@ -1,9 +1,13 @@
 package com.mitchej123.supernova.client;
 
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class ColoredLightHelperTest {
 
@@ -15,132 +19,190 @@ class ColoredLightHelperTest {
         return out;
     }
 
-    @Test
-    void testBothBelowThreshold() {
-        float[] result = tint(0.4f, 0.2f, 0.1f, 0.3f, 0.1f, 0.0f);
-        assertArrayEquals(new float[] { 1f, 1f, 1f }, result);
-    }
-
-    @Test
-    void testBothZero() {
-        float[] result = tint(0, 0, 0, 0, 0, 0);
-        assertArrayEquals(new float[] { 1f, 1f, 1f }, result);
-    }
-
-    @Test
-    void testPureBlockLightRed() {
-        // Only block light, red dominant -- should tint red
-        float[] result = tint(15, 2, 0, 0, 0, 0);
-        // Normalized block: (1.0, 2/15, 0), sky: (1,1,1) but skyMax=0 so sw≈0
-        // Result should be close to (1.0, 2/15, 0)
-        assertEquals(1.0f, result[0], EPSILON);
-        assertEquals(2f / 15f, result[1], EPSILON);
-        assertEquals(0f, result[2], EPSILON);
-    }
-
-    @Test
-    void testPureSkyLightWhite() {
-        // Only sky light, uniform -- should produce white tint
-        float[] result = tint(0, 0, 0, 10, 10, 10);
-        assertEquals(1.0f, result[0], EPSILON);
-        assertEquals(1.0f, result[1], EPSILON);
-        assertEquals(1.0f, result[2], EPSILON);
-    }
-
-    @Test
-    void testPureSkyLightColored() {
-        // Only sky light, blue-tinted
-        float[] result = tint(0, 0, 0, 5, 5, 10);
-        // Normalized sky: (0.5, 0.5, 1.0), bw≈0
-        assertEquals(0.5f, result[0], EPSILON);
-        assertEquals(0.5f, result[1], EPSILON);
-        assertEquals(1.0f, result[2], EPSILON);
-    }
-
-    @Test
-    void testEqualSourcesUniform() {
-        // Both sources equal brightness, both white -> white tint
-        float[] result = tint(10, 10, 10, 10, 10, 10);
-        assertEquals(1.0f, result[0], EPSILON);
-        assertEquals(1.0f, result[1], EPSILON);
-        assertEquals(1.0f, result[2], EPSILON);
-    }
-
-    @Test
-    void testDominantBlockLight() {
-        // Block=15 red, sky=2 white -> block dominates
-        float[] result = tint(15, 0, 0, 2, 2, 2);
-        // bm2=225, sm2=4, total=225+4+0.001≈229
-        // bw≈0.983, sw≈0.017
-        // bt=(1,0,0), st=(1,1,1)
-        // result ≈ (0.983+0.017, 0.017, 0.017) ≈ (1.0, 0.017, 0.017)
-        assertEquals(1.0f, result[0], 0.01f);
-        assertTrue(result[1] < 0.05f, "green should be near zero: " + result[1]);
-        assertTrue(result[2] < 0.05f, "blue should be near zero: " + result[2]);
-    }
-
-    @Test
-    void testDominantSkyLight() {
-        // Block=2 red, sky=15 white -> sky dominates
-        float[] result = tint(2, 0, 0, 15, 15, 15);
-        // bm2=4, sm2=225 -> sw≈0.983
-        // Result ≈ sky-dominated white
-        assertTrue(result[0] > 0.95f, "red should be near 1: " + result[0]);
-        assertTrue(result[1] > 0.95f, "green should be near 1: " + result[1]);
-        assertTrue(result[2] > 0.95f, "blue should be near 1: " + result[2]);
-    }
-
-    @Test
-    void testOutputReuse() {
-        // Verify that different calls produce correct independent results
+    private static float[] tint(TintBlendMode mode, float[] in) {
         float[] out = new float[3];
-        ColoredLightHelper.computeTint(15, 0, 0, 0, 0, 0, out);
-        assertEquals(1.0f, out[0], EPSILON);
-        assertEquals(0f, out[1], EPSILON);
-
-        ColoredLightHelper.computeTint(0, 0, 0, 10, 10, 10, out);
-        assertEquals(1.0f, out[0], EPSILON);
-        assertEquals(1.0f, out[1], EPSILON);
-        assertEquals(1.0f, out[2], EPSILON);
+        mode.computeTint(in[0], in[1], in[2], in[3], in[4], in[5], out);
+        return out;
     }
 
-    @Test
-    void testSymmetricColorsEqualWeight() {
-        // Block=red at 10, sky=blue at 10 -> equal weights
-        float[] result = tint(10, 0, 0, 0, 0, 10);
-        // bm2=sm2=100, bw=sw=0.5 (approx)
-        // bt=(1,0,0), st=(0,0,1)
-        // result ≈ (0.5, 0, 0.5)
-        assertEquals(result[0], result[2], 0.01f);
-        assertEquals(0f, result[1], EPSILON);
-        assertTrue(result[0] > 0.45f && result[0] < 0.55f, "expected ~0.5: " + result[0]);
+    private static float[] tintImpl(TintBlendMode mode, float[] in) {
+        float[] out = new float[3];
+        mode.computeTintImpl(in[0], in[1], in[2], in[3], in[4], in[5], out);
+        return out;
     }
 
-    @Test
-    void testBlockThresholdBoundary() {
-        // blockMax exactly 0.5 -> below threshold, treated as white
-        float[] result = tint(0.5f, 0, 0, 10, 10, 10);
-        // blockMax=0.5, skyMax=10
-        // blockMax > 0.5 is false -> invBlock=0 -> bt=(1,1,1)
-        // bm2=0.25, sm2=100 -> bw≈0.0025, sw≈0.997
-        // result ≈ (1*0.0025+1*0.997, 1*0.0025+1*0.997, 1*0.0025+1*0.997) ≈ (1,1,1)
-        assertEquals(1.0f, result[0], 0.01f);
-        assertEquals(1.0f, result[1], 0.01f);
-        assertEquals(1.0f, result[2], 0.01f);
+    @Nested
+    class ThroughHelper {
+
+        /** Tint function and blend mode are process-wide globals AngelicaCompat may have changed. */
+        @BeforeEach
+        void pinBlendMode() {
+            TintBlendMode.current = TintBlendMode.SQUARED_WEIGHT;
+            ColoredLightHelper.setActiveTintFunction(
+                (br, bg, bb, sr, sg, sb, out) -> TintBlendMode.current.computeTint(br, bg, bb, sr, sg, sb, out));
+        }
+
+        private float weighted(float unweighted, float maxLight) {
+            final float w = TintBlendMode.hueConfidence(maxLight);
+            return 1f + (unweighted - 1f) * w;
+        }
+
+        @Test
+        void bothBelowThreshold() {
+            float[] result = tint(0.4f, 0.2f, 0.1f, 0.3f, 0.1f, 0.0f);
+            assertArrayEquals(new float[] { 1f, 1f, 1f }, result);
+        }
+
+        @Test
+        void pureBlockLightRed() {
+            float[] result = tint(15, 2, 0, 0, 0, 0);
+            assertEquals(1.0f, result[0], EPSILON);
+            assertEquals(2f / 15f, result[1], EPSILON);
+            assertEquals(0f, result[2], EPSILON);
+        }
+
+        @Test
+        void pureSkyLightWhite() {
+            float[] result = tint(0, 0, 0, 10, 10, 10);
+            assertEquals(1.0f, result[0], EPSILON);
+            assertEquals(1.0f, result[1], EPSILON);
+            assertEquals(1.0f, result[2], EPSILON);
+        }
+
+        @Test
+        void pureSkyLightColored() {
+            float[] result = tint(0, 0, 0, 5, 5, 10);
+            assertEquals(weighted(0.5f, 10f), result[0], EPSILON);
+            assertEquals(weighted(0.5f, 10f), result[1], EPSILON);
+            assertEquals(1.0f, result[2], EPSILON);
+        }
+
+        @Test
+        void equalSourcesUniform() {
+            float[] result = tint(10, 10, 10, 10, 10, 10);
+            assertEquals(1.0f, result[0], EPSILON);
+            assertEquals(1.0f, result[1], EPSILON);
+            assertEquals(1.0f, result[2], EPSILON);
+        }
+
+        @Test
+        void dominantBlockLight() {
+            float[] result = tint(15, 0, 0, 2, 2, 2);
+            assertEquals(1.0f, result[0], EPSILON);
+            assertEquals(0.0174672f, result[1], EPSILON);
+            assertEquals(0.0174672f, result[2], EPSILON);
+        }
+
+        @Test
+        void dominantSkyLight() {
+            float[] result = tint(2, 0, 0, 15, 15, 15);
+            assertEquals(1.0f, result[0], EPSILON);
+            assertEquals(0.9825328f, result[1], EPSILON);
+            assertEquals(0.9825328f, result[2], EPSILON);
+        }
+
+        @Test
+        void symmetricColorsEqualWeight() {
+            float[] result = tint(10, 0, 0, 0, 0, 10);
+            assertEquals(weighted(0.5f, 10f), result[0], EPSILON);
+            assertEquals(weighted(0f, 10f), result[1], EPSILON);
+            assertEquals(weighted(0.5f, 10f), result[2], EPSILON);
+        }
+
+        @Test
+        void blockThresholdBoundary() {
+            // blockMax exactly 0.5 is below the threshold, so the block contribution is neutral white.
+            float[] result = tint(0.5f, 0, 0, 10, 10, 10);
+            assertEquals(1.0f, result[0], EPSILON);
+            assertEquals(1.0f, result[1], EPSILON);
+            assertEquals(1.0f, result[2], EPSILON);
+        }
+
+        @Test
+        void blockJustAboveThreshold() {
+            float[] result = tint(0.6f, 0.3f, 0, 0, 0, 0);
+            assertEquals(1.0f, result[0], EPSILON);
+            assertEquals(weighted(0.5f, 0.6f), result[1], EPSILON);
+            assertEquals(weighted(0f, 0.6f), result[2], EPSILON);
+        }
     }
 
-    @Test
-    void testBlockJustAboveThreshold() {
-        // blockMax=0.6 -> above threshold, normalize by blockMax
-        // sky=0 -> invSky=0 -> st=(1,1,1) but sw≈0 so sky contribution negligible
-        float[] result = tint(0.6f, 0.3f, 0, 0, 0, 0);
-        // bt = (1.0, 0.5, 0), bw≈0.997; st = (1,1,1), sw≈0.003
-        assertEquals(1.0f, result[0], 0.01f);
-        assertEquals(0.5f, result[1], 0.01f);
-        assertTrue(result[2] < 0.01f, "blue should be near zero: " + result[2]);
-    }
+    @Nested
+    class BlendModes {
 
-    private static void assertTrue(boolean condition, String message) {
-        if (!condition) throw new AssertionError(message);
+        private float distFromWhite(float[] tint) {
+            return Math.max(Math.abs(tint[0] - 1f), Math.max(Math.abs(tint[1] - 1f), Math.abs(tint[2] - 1f)));
+        }
+
+        @Test
+        void dimSourcesTintWeakerThanBrightOnesOfTheSameHue() {
+            for (TintBlendMode mode : TintBlendMode.values()) {
+                float[] dim = tint(mode, new float[] { 1, 0, 0, 0, 0, 0 });
+                float[] bright = tint(mode, new float[] { 15, 0, 0, 0, 0, 0 });
+                assertNotEquals(distFromWhite(bright), distFromWhite(dim), 1e-3f,
+                        mode + " tints a level-1 source exactly like a level-15 source");
+                assertTrue(distFromWhite(dim) < distFromWhite(bright), mode + " did not weaken the dim source's tint");
+                assertTrue(distFromWhite(dim) < 0.05f, mode + " left a level-1 source visibly tinted: " + distFromWhite(dim));
+            }
+        }
+
+        @Test
+        void zeroLightIsFullyNeutral() {
+            for (TintBlendMode mode : TintBlendMode.values()) {
+                assertArrayEquals(new float[] { 1f, 1f, 1f }, tint(mode, new float[] { 0, 0, 0, 0, 0, 0 }), 1e-6f,
+                        mode + " tinted a completely unlit position");
+            }
+        }
+
+        @Test
+        void fullLightIsAStrictNoOp() {
+            for (TintBlendMode mode : TintBlendMode.values()) {
+                for (float[] in : new float[][] {
+                        { 15, 0, 0, 0, 0, 0 },
+                        { 0, 0, 0, 15, 15, 15 },
+                        { 5, 7, 3, 15, 15, 15 } }) {
+                    assertArrayEquals(tintImpl(mode, in), tint(mode, in), 0f, mode + " altered a fully-lit position");
+                }
+            }
+        }
+
+        @Test
+        void confidenceIsMonotonicAndBounded() {
+            assertEquals(0f, TintBlendMode.hueConfidence(0f), 1e-6f, "not neutral in the dark");
+            assertEquals(1f, TintBlendMode.hueConfidence(15f), 1e-6f, "does not reach full confidence");
+            float prev = TintBlendMode.hueConfidence(0f);
+            for (float level = 0.25f; level <= 15f; level += 0.25f) {
+                float w = TintBlendMode.hueConfidence(level);
+                assertTrue(w >= 0f && w <= 1f, "out of range at " + level + ": " + w);
+                assertTrue(w > prev, "did not increase at " + level);
+                prev = w;
+            }
+        }
+
+        @Test
+        void confidenceClampsOutOfRangeInput() {
+            assertEquals(0f, TintBlendMode.hueConfidence(-3f), 1e-6f, "underflowed");
+            assertEquals(1f, TintBlendMode.hueConfidence(20f), 1e-6f, "overflowed");
+        }
+
+        @Test
+        void saturationIsNonDecreasingInIntensity() {
+            for (TintBlendMode mode : TintBlendMode.values()) {
+                float prev = 0f;
+                for (int level = 1; level <= 15; level++) {
+                    float dist = distFromWhite(tint(mode, new float[] { 0, level, 0, 0, 0, 0 }));
+                    assertTrue(dist >= prev - 1e-5f, mode + " regressed at level " + level);
+                    prev = dist;
+                }
+            }
+        }
+
+        @Test
+        void fullWhiteSkyStaysWhite() {
+            for (TintBlendMode mode : TintBlendMode.values()) {
+                assertArrayEquals(new float[] { 1f, 1f, 1f }, tint(mode, new float[] { 0, 0, 0, 15, 15, 15 }), 1e-3f,
+                        mode + " tinted full white sky");
+            }
+        }
     }
 }

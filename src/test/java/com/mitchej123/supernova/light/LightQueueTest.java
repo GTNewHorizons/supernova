@@ -1,12 +1,10 @@
 package com.mitchej123.supernova.light;
 
+import com.mitchej123.supernova.light.engine.MCBootstrap;
 import com.mitchej123.supernova.util.CoordinateUtils;
 import net.minecraft.world.chunk.Chunk;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-import sun.misc.Unsafe;
-
-import java.lang.reflect.Field;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -16,19 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class LightQueueTest {
 
-    /** Non-null Chunk sentinel created via Unsafe (no constructor, no MC deps). */
-    private static final Chunk DUMMY_CHUNK;
-
-    static {
-        try {
-            final Field f = Unsafe.class.getDeclaredField("theUnsafe");
-            f.setAccessible(true);
-            final Unsafe unsafe = (Unsafe) f.get(null);
-            DUMMY_CHUNK = (Chunk) unsafe.allocateInstance(Chunk.class);
-        } catch (final Exception e) {
-            throw new RuntimeException(e);
-        }
-    }
+    private static final Chunk DUMMY_CHUNK = MCBootstrap.allocate(Chunk.class);
 
     private LightQueue queue;
 
@@ -38,7 +24,7 @@ class LightQueueTest {
     }
 
     @Test
-    void testEmptyQueue() {
+    void emptyQueue() {
         assertTrue(queue.isEmpty());
         assertEquals(0, queue.size());
         assertNull(queue.removeFirstTask());
@@ -48,45 +34,39 @@ class LightQueueTest {
     }
 
     @Test
-    void testBlockChangePriority() {
-        // Queue edge check first, then block change on different chunk
-        queue.queueEdgeCheck(0, 0, 0, true);
-        queue.queueBlockChange(16, 64, 16); // chunk (1, 1)
+    void blockChangePriority() {
+        queue.queueEdgeCheckAllSections(0, 0);
+        queue.queueBlockChange(16, 64, 16);
 
-        // removeFirstBlockChangeTask should find the block change, skipping the edge-only task
         final ChunkTasks blockTask = queue.removeFirstBlockChangeTask();
         assertNotNull(blockTask);
         assertEquals(CoordinateUtils.getChunkKey(1, 1), blockTask.chunkCoordinate);
         assertNotNull(blockTask.changedPositions);
         assertFalse(blockTask.changedPositions.isEmpty());
 
-        // Edge-only task still in queue
         final ChunkTasks edgeTask = queue.removeFirstTask();
         assertNotNull(edgeTask);
         assertEquals(CoordinateUtils.getChunkKey(0, 0), edgeTask.chunkCoordinate);
     }
 
     @Test
-    void testInitialLightPriority() {
-        // Queue edge check first, then initial light on different chunk
-        queue.queueEdgeCheck(0, 0, 0, true);
-        queue.queueChunkLight(1, 1, DUMMY_CHUNK, null);
+    void initialLightPriority() {
+        queue.queueEdgeCheckAllSections(0, 0);
+        queue.queueChunkLight(1, 1, DUMMY_CHUNK, null, 1L);
 
-        // removeFirstInitialLightTask should find the initial light task
         final ChunkTasks lightTask = queue.removeFirstInitialLightTask();
         assertNotNull(lightTask);
         assertEquals(CoordinateUtils.getChunkKey(1, 1), lightTask.chunkCoordinate);
 
-        // Edge-only task still in queue
         assertNull(queue.removeFirstInitialLightTask());
         assertNotNull(queue.removeFirstTask());
     }
 
     @Test
-    void testRemoveFirstTaskFIFO() {
-        queue.queueEdgeCheck(0, 0, 0, true);
-        queue.queueEdgeCheck(1, 1, 1, true);
-        queue.queueEdgeCheck(2, 2, 2, true);
+    void removeFirstTaskFIFO() {
+        queue.queueEdgeCheckAllSections(0, 0);
+        queue.queueEdgeCheckAllSections(1, 1);
+        queue.queueEdgeCheckAllSections(2, 2);
 
         assertEquals(CoordinateUtils.getChunkKey(0, 0), queue.removeFirstTask().chunkCoordinate);
         assertEquals(CoordinateUtils.getChunkKey(1, 1), queue.removeFirstTask().chunkCoordinate);
@@ -95,10 +75,9 @@ class LightQueueTest {
     }
 
     @Test
-    void testCoalescingBlockChanges() {
-        // Two block changes in the same chunk should merge
-        queue.queueBlockChange(5, 64, 7);   // pos1
-        queue.queueBlockChange(10, 80, 3);  // pos2, same chunk (0, 0)
+    void coalescingBlockChanges() {
+        queue.queueBlockChange(5, 64, 7);
+        queue.queueBlockChange(10, 80, 3);
 
         assertEquals(1, queue.size());
         final ChunkTasks task = queue.removeFirstTask();
@@ -112,70 +91,130 @@ class LightQueueTest {
     }
 
     @Test
-    void testEdgeCheckCoalescing() {
-        queue.queueEdgeCheck(0, 0, 3, true);
-        queue.queueEdgeCheck(0, 0, 7, true);
-        queue.queueEdgeCheck(0, 0, 3, false); // block edge, same section
-
-        assertEquals(1, queue.size());
-        final ChunkTasks task = queue.removeFirstTask();
-        assertNotNull(task.queuedEdgeChecksSky);
-        assertTrue(task.queuedEdgeChecksSky.contains(3));
-        assertTrue(task.queuedEdgeChecksSky.contains(7));
-        assertNotNull(task.queuedEdgeChecksBlock);
-        assertTrue(task.queuedEdgeChecksBlock.contains(3));
-    }
-
-    @Test
-    void testRemoveChunk() {
+    void removeChunk() {
         queue.queueBlockChange(5, 64, 7);
         assertTrue(queue.hasPendingWork(0, 0));
 
-        queue.removeChunk(0, 0);
+        final ChunkTasks removed = queue.removeChunk(0, 0);
+        assertNotNull(removed);
+        assertNull(removed.initialLightChunk, "block-change-only task must not count as a dropped initial light");
+        assertNull(queue.removeChunk(0, 0));
         assertFalse(queue.hasPendingWork(0, 0));
         assertTrue(queue.isEmpty());
     }
 
     @Test
-    void testBlockChangeNotReturnedByInitialLightRemove() {
-        // Block-change-only task should not be returned by removeFirstInitialLightTask
+    void removeChunkReturnsQueuedInitialLightTask() {
+        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null, 1L);
+
+        final ChunkTasks removed = queue.removeChunk(0, 0);
+        assertNotNull(removed);
+        assertNotNull(removed.initialLightChunk, "queued-unstarted initial light must be visible to the caller");
+        assertNull(queue.removeChunk(0, 0));
+    }
+
+    @Test
+    void dequeuedTaskStaysVisibleUntilCompleted() {
         queue.queueBlockChange(5, 64, 7);
-        assertNull(queue.removeFirstInitialLightTask());
-        // But should still be in queue
-        assertFalse(queue.isEmpty());
+        final ChunkTasks task = queue.removeFirstBlockChangeTask();
+        assertNotNull(task);
+
+        assertTrue(queue.hasPendingWork(0, 0), "a task a worker is running is still work on that chunk");
+        assertNotNull(queue.pendingWorkFuture(CoordinateUtils.getChunkKey(0, 0)));
+        assertNull(queue.removeChunk(0, 0), "task already dequeued by a worker must not be reported as dropped");
+
+        queue.completeTask(task);
+        assertFalse(queue.hasPendingWork(0, 0));
+        assertNull(queue.pendingWorkFuture(CoordinateUtils.getChunkKey(0, 0)));
     }
 
     @Test
-    void testHasInitialLightTask() {
+    void edgeOnlyWorkRemainsPendingUntilComplete() {
+        queue.queueEdgeCheckAllSections(0, 0);
+        final long key = CoordinateUtils.getChunkKey(0, 0);
+
+        assertTrue(queue.hasPendingWork(0, 0));
+        assertNotNull(queue.pendingWorkFuture(key));
+        final ChunkTasks task = queue.removeFirstTask();
+        assertNotNull(queue.pendingWorkFuture(key));
+        queue.completeTask(task);
+        assertNull(queue.pendingWorkFuture(key));
+    }
+
+    @Test
+    void olderGenerationDoesNotOverwriteNewer() {
+        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null, 5L);
+        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null, 3L);
+
+        final ChunkTasks task = queue.removeFirstInitialLightTask();
+        assertEquals(5L, task.lightGeneration, "a stale relight must not clobber the live one");
+    }
+
+    @Test
+    void newPropagationSupersedesAQueuedEdgePass() {
+        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null, 1L);
+        queue.removeFirstInitialLightTask();
+        queue.queueInitialLightEdges(0, 0, 1L, 0);
+        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null, 2L);
+
+        final ChunkTasks task = queue.removeFirstInitialLightTask();
+        assertEquals(2L, task.lightGeneration);
+        assertFalse(task.edgePass, "the newer propagation will re-drive its own edge pass");
+    }
+
+    @Test
+    void requeueIncrementsAttempts() {
+        queue.requeueChunkLight(0, 0, DUMMY_CHUNK, null, 1L, 0);
+        ChunkTasks task = queue.removeFirstInitialLightTask();
+        assertEquals(1, task.attempts);
+
+        queue.requeueChunkLight(0, 0, DUMMY_CHUNK, null, 1L, 2);
+        task = queue.removeFirstInitialLightTask();
+        assertEquals(3, task.attempts);
+    }
+
+    @Test
+    void mixedTaskCoalescing() {
         queue.queueBlockChange(5, 64, 7);
-        assertFalse(queue.hasInitialLightTask());
-
-        queue.queueChunkLight(1, 1, DUMMY_CHUNK, null);
-        assertTrue(queue.hasInitialLightTask());
-    }
-
-    @Test
-    void testRequeueIncrementsAttempts() {
-        queue.requeueChunkLight(0, 0, DUMMY_CHUNK, null, 0);
-        ChunkTasks task = queue.removeFirstTask();
-        assertEquals(1, task.relightAttempts);
-
-        queue.requeueChunkLight(0, 0, DUMMY_CHUNK, null, 2);
-        task = queue.removeFirstTask();
-        assertEquals(3, task.relightAttempts);
-    }
-
-    @Test
-    void testMixedTaskCoalescing() {
-        // Same chunk gets block change + initial light + edge check -> single task with all fields
-        queue.queueBlockChange(5, 64, 7);      // chunk (0, 0)
-        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null);
-        queue.queueEdgeCheck(0, 0, 4, true);
+        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null, 1L);
+        queue.queueEdgeCheckAllSections(0, 0);
 
         assertEquals(1, queue.size());
         final ChunkTasks task = queue.removeFirstTask();
         assertNotNull(task.changedPositions);
         assertNotNull(task.initialLightChunk);
-        assertNotNull(task.queuedEdgeChecksSky);
+        assertNotNull(task.queuedEdgeChecks);
+    }
+
+    @Test
+    void hasInitialLightTaskTracksQueuedTasksOnly() {
+        assertFalse(queue.hasInitialLightTask());
+
+        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null, 1L);
+        assertTrue(queue.hasInitialLightTask());
+
+        assertNotNull(queue.removeFirstInitialLightTask());
+        assertFalse(queue.hasInitialLightTask(), "a dequeued task is no longer queued work");
+
+        queue.queueChunkLight(1, 1, DUMMY_CHUNK, null, 2L);
+        assertTrue(queue.hasInitialLightTask());
+        assertNotNull(queue.removeChunk(1, 1));
+        assertFalse(queue.hasInitialLightTask(), "an unload drops the queued initial light");
+    }
+
+    @Test
+    void removingAMergedTaskClearsBothCounters() {
+        queue.queueBlockChange(5, 64, 7);
+        queue.queueChunkLight(0, 0, DUMMY_CHUNK, null, 1L);
+        assertEquals(1, queue.size());
+
+        final ChunkTasks task = queue.removeFirstBlockChangeTask();
+        assertNotNull(task);
+        assertNotNull(task.initialLightChunk);
+
+        assertFalse(queue.hasInitialLightTask());
+        assertNull(queue.removeFirstInitialLightTask());
+        assertNull(queue.removeFirstBlockChangeTask());
+        assertTrue(queue.isEmpty());
     }
 }

@@ -1,5 +1,6 @@
 package com.mitchej123.supernova.client;
 
+import com.mitchej123.supernova.light.ChunkLightHelper;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.light.SupernovaChunk;
 import com.mitchej123.supernova.util.WorldUtil;
@@ -35,6 +36,8 @@ public final class ColoredLightHelper {
     private static final float[][] VERTEX_TINTS = new float[4][3];
     private static final float[][] NO_VERTEX_TINTS = { { 1, 1, 1 }, { 1, 1, 1 }, { 1, 1, 1 }, { 1, 1, 1 } };
 
+    private static final int[] SAMPLES = new int[9];
+
     private static final int CACHE_SIZE = 4;
     private static final int[] cachedChunkXs = new int[CACHE_SIZE];
     private static final int[] cachedChunkZs = new int[CACHE_SIZE];
@@ -66,7 +69,6 @@ public final class ColoredLightHelper {
 
     private ColoredLightHelper() {}
 
-    /** Delegates to the currently active {@link TintBlendMode}. */
     static void computeTint(float br, float bg, float bb, float sr, float sg, float sb, float[] out) {
         // White sky + no block light -> always white tint regardless of blend mode
         if (sr >= 14.5f && sg >= 14.5f && sb >= 14.5f && br < 0.5f && bg < 0.5f && bb < 0.5f) {
@@ -76,9 +78,7 @@ public final class ColoredLightHelper {
         activeTintFunction.computeTint(br, bg, bb, sr, sg, sb, out);
     }
 
-    /**
-     * Flat (non-AO) RGB tint from 6 neighbours. Returns {1,1,1} when no block light present. Returned array is reused -- consume values before calling again.
-     */
+    /** Flat tint from six neighbors. Returns {1,1,1} with no light; consume the reused array before the next call. */
     public static float[] getBlockTint(int x, int y, int z) {
         final World world = Minecraft.getMinecraft().theWorld;
         if (world == null) return NO_TINT;
@@ -147,6 +147,13 @@ public final class ColoredLightHelper {
         final float sub = world.skylightSubtracted;
         final float[][] vertexTints = VERTEX_TINTS;
 
+        final int[] samplesGrid = SAMPLES;
+        for (int a = -1; a <= 1; a++) {
+            for (int b = -1; b <= 1; b++) {
+                samplesGrid[(a + 1) * 3 + (b + 1)] = readLight(world, fcx + a * tanA[0] + b * tanB[0], fcy + a * tanA[1] + b * tanB[1], fcz + a * tanA[2] + b * tanB[2], minLight, maxLight);
+            }
+        }
+
         for (int corner = 0; corner < 4; corner++) {
             final int sa = CORNER_SIGNS[face][corner][0];
             final int sb = CORNER_SIGNS[face][corner][1];
@@ -157,11 +164,7 @@ public final class ColoredLightHelper {
 
             for (int da = 0; da <= 1; da++) {
                 for (int db = 0; db <= 1; db++) {
-                    final int sx = fcx + da * sa * tanA[0] + db * sb * tanB[0];
-                    final int sy = fcy + da * sa * tanA[1] + db * sb * tanB[1];
-                    final int sz = fcz + da * sa * tanA[2] + db * sb * tanB[2];
-
-                    final int packed = readLight(world, sx, sy, sz, minLight, maxLight);
+                    final int packed = samplesGrid[(1 + da * sa) * 3 + (1 + db * sb)];
                     if (packed < 0) continue;
 
                     totalBlockR += packed & 0xF;
@@ -200,10 +203,7 @@ public final class ColoredLightHelper {
         return readLight(world, x, y, z, WorldUtil.getMinLightSection(), WorldUtil.getMaxLightSection());
     }
 
-    /**
-     * Read RGB block light + RGB sky light at (x, y, z). Returns packed
-     * {@code blockR | (blockG << 4) | (blockB << 8) | (skyR << 12) | (skyG << 16) | (skyB << 20)}, or -1 if unavailable.
-     */
+    /** Packed {@code bR | bG<<4 | bB<<8 | sR<<12 | sG<<16 | sB<<20}, or -1 if unavailable. */
     private static int readLight(final World world, final int x, final int y, final int z, final int minLight, final int maxLight) {
         if (y < WorldUtil.getMinBlockY() || y > WorldUtil.getMaxBlockY()) return -1;
 
@@ -236,9 +236,9 @@ public final class ColoredLightHelper {
         final int r = readNibble(ext.getBlockNibblesR(), idx, x, y, z);
         final int g = readNibble(ext.getBlockNibblesG(), idx, x, y, z);
         final int b = readNibble(ext.getBlockNibblesB(), idx, x, y, z);
-        final int skyR = readSkyNibble(ext.getSkyNibblesR(), idx, x, y, z);
-        final int skyG = readSkyNibble(ext.getSkyNibblesG(), idx, x, y, z);
-        final int skyB = readSkyNibble(ext.getSkyNibblesB(), idx, x, y, z);
+        final int skyR = ChunkLightHelper.readSkyChannel(ext.getSkyNibblesR(), idx, x, y, z, 15);
+        final int skyG = ChunkLightHelper.readSkyChannel(ext.getSkyNibblesG(), idx, x, y, z, skyR);
+        final int skyB = ChunkLightHelper.readSkyChannel(ext.getSkyNibblesB(), idx, x, y, z, skyR);
 
         return r | (g << 4) | (b << 8) | (skyR << 12) | (skyG << 16) | (skyB << 20);
     }
@@ -250,11 +250,4 @@ public final class ColoredLightHelper {
         return nib.getVisible(x, y, z);
     }
 
-    private static int readSkyNibble(final SWMRNibbleArray[] nibbles, final int idx, final int x, final int y, final int z) {
-        if (nibbles == null) return 15;
-        if (idx < 0 || idx >= nibbles.length) return 15;
-        final SWMRNibbleArray nib = nibbles[idx];
-        if (nib == null || nib.isNullNibbleVisible()) return 15;
-        return nib.getVisible(x, y, z);
-    }
 }

@@ -3,7 +3,7 @@ package com.mitchej123.supernova.api;
 import net.minecraft.world.IBlockAccess;
 
 /**
- * Extension of {@link ColoredTranslucency} for blocks whose per-channel absorption varies by position.
+ * Extension of {@link ColoredTranslucency} for blocks whose per-channel transmission varies by position.
  *
  * @see TranslucencyRegistry
  */
