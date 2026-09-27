@@ -1,8 +1,8 @@
 package com.mitchej123.supernova.light.engine;
 
+import com.mitchej123.supernova.api.ExtendedSection;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.light.SupernovaChunk;
-import com.mitchej123.supernova.util.SnapshotChunkMap;
 import com.mitchej123.supernova.util.WorldUtil;
 import net.minecraft.block.Block;
 import net.minecraft.init.Blocks;
@@ -12,14 +12,11 @@ import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 
 import java.util.Arrays;
 
-/**
- * Scalar (non-RGB) sky light engine.
- */
 public class ScalarSkyEngine extends SupernovaEngine {
 
     private final boolean[] nullPropagationCheckCache;
 
-    public ScalarSkyEngine(final World world, final SnapshotChunkMap chunkMap) {
+    public ScalarSkyEngine(final World world) {
         super(true, world);
         this.nullPropagationCheckCache = new boolean[WorldUtil.getTotalLightSections()];
         this.increaseQueue = new long[1 << 18]; // 256K entries -- sky BFS covers far more blocks than block light
@@ -49,7 +46,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
 
     @Override
     protected boolean canUseChunk(final Chunk chunk) {
-        return ((SupernovaChunk) chunk).isLightReady();
+        return ((SupernovaChunk) chunk).isLightUsable();
     }
 
     @Override
@@ -78,7 +75,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
             return;
         }
 
-        // Find lowest non-empty section in this column -- sections above it should always be FULL sky.
+        // Sections above the lowest non-empty one are always full sky.
         final boolean[] emptinessMap = this.getEmptinessMap(chunkX, chunkZ);
         int lowestNonEmpty = this.minSection - 1;
         for (int cy = this.maxSection; cy >= this.minSection; --cy) {
@@ -86,18 +83,17 @@ public class ScalarSkyEngine extends SupernovaEngine {
                 if (emptinessMap[cy - this.minSection]) continue;
             } else {
                 final ExtendedBlockStorage section = this.getChunkSection(chunkX, cy, chunkZ);
-                if (section == null || section.isEmpty()) continue;
+                if (section == null || ((ExtendedSection) section).supernova$hasNoBlocks()) continue;
             }
             lowestNonEmpty = cy;
             break;
         }
 
         if (chunkY > lowestNonEmpty) {
-            // Above all terrain -- always full sky, regardless of extrude flag
+            // Above all terrain: full sky whatever the extrude flag says.
             nibble.setNonNull();
             nibble.setFull();
         } else if (emptinessMap != null && emptinessMap[chunkY - this.minSection]) {
-            // Empty section at or below terrain level
             if (extrude) {
                 final SWMRNibbleArray above = this.getNibbleFromCache(chunkX, chunkY + 1, chunkZ);
                 if (above != null && above.isFullUpdating()) {
@@ -171,7 +167,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
             return this.getLightLevel(idx, (worldX & 15) | ((worldZ & 15) << 4) | ((worldY & 15) << 8));
         }
 
-        // Search upward for the nearest non-null section (sky extrusion -- above empty = full sky)
+        // Sky extrusion: a null section inherits the nearest non-null one above it.
         while (++chunkY <= this.maxLightSection) {
             final int nextIdx = chunkX + 5 * chunkZ + (5 * 5) * chunkY + this.chunkSectionIndexOffset;
             if (this.nibbleCache[nextIdx] != null) {
@@ -195,6 +191,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
         int currentSky = extrudedLevel;
 
         Block above = this.getBlock(worldX, startY + 1, worldZ);
+        long[] aboveBits = FaceOcclusion.sidedFaceBits(this.lastBlockId);
         int aboveMeta = this.getBlockMeta(worldX, startY + 1, worldZ);
 
         for (; startY >= (this.minLightSection << 4); --startY) {
@@ -202,22 +199,19 @@ public class ScalarSkyEngine extends SupernovaEngine {
                 this.checkNullSection(worldX >> 4, startY >> 4, worldZ >> 4, extrudeInitialised);
             }
             final Block current = this.getBlock(worldX, startY, worldZ);
+            final long[] bits = FaceOcclusion.sidedFaceBits(this.lastBlockId);
             final int meta = this.getBlockMeta(worldX, startY, worldZ);
 
-            // Check if light can pass DOWN through the above block
+            // Light must leave the block above through its bottom face (axisDir 5).
             final int aboveOpacity = above.getLightOpacity();
-            if (aboveOpacity > 0) {
-                if (!FaceOcclusion.hasSidedTransparency(above) || FaceOcclusion.isFaceSolid(above, aboveMeta, 5)) {
-                    break;
-                }
+            if (aboveOpacity > 0 && FaceOcclusion.isFaceSolid(aboveBits, above, aboveMeta, 5)) {
+                break;
             }
 
-            // Check if light can enter the current block from above
+            // ...and enter this one through its top face (4).
             final int currentOpacity = current.getLightOpacity();
-            if (currentOpacity > 0) {
-                if (!FaceOcclusion.hasSidedTransparency(current) || FaceOcclusion.isFaceSolid(current, meta, 4)) {
-                    break;
-                }
+            if (currentOpacity > 0 && FaceOcclusion.isFaceSolid(bits, current, meta, 4)) {
+                break;
             }
 
             if (currentOpacity > 0) {
@@ -235,13 +229,16 @@ public class ScalarSkyEngine extends SupernovaEngine {
                 --this.increaseQueueInitialLength;
                 startY = startY & ~15;
                 above = Blocks.air;
+                aboveBits = FaceOcclusion.sidedFaceBits(Block.getIdFromBlock(Blocks.air));
                 aboveMeta = 0;
             } else if (!delayLightSet) {
                 this.setLightLevel(worldX, startY, worldZ, currentSky);
                 above = current;
+                aboveBits = bits;
                 aboveMeta = meta;
             } else {
                 above = current;
+                aboveBits = bits;
                 aboveMeta = meta;
             }
         }
@@ -314,7 +311,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
         final int encodeOffset = this.coordinateOffset;
 
         if (currentLevel == 15) {
-            // 15 is a sky source -- re-propagate but never decrease
+            // 15 is a sky source: re-propagate, never decrease.
             this.appendToIncreaseQueue(encodeCoords(worldX, worldZ, worldY, encodeOffset)
                     | this.encodeQueueLevel(15)
                     | (((long) ALL_DIRECTIONS_BITSET) << DIRECTION_SHIFT));
@@ -334,9 +331,10 @@ public class ScalarSkyEngine extends SupernovaEngine {
 
         final int sectionOffset = this.chunkSectionIndexOffset;
         final Block centerBlock = this.getBlock(worldX, worldY, worldZ);
+        final long[] bits = FaceOcclusion.sidedFaceBits(this.lastBlockId);
         final int rawOpacity = centerBlock.getLightOpacity();
         final int meta = this.getBlockMeta(worldX, worldY, worldZ);
-        final boolean sidedTransparent = rawOpacity > 1 && FaceOcclusion.hasSidedTransparency(centerBlock);
+        final boolean sidedTransparent = rawOpacity > 1 && bits != FaceOcclusion.NOT_SIDED;
         final int uniformAbsorption = !sidedTransparent ? Math.max(1, rawOpacity) : 0;
 
         int level = 0;
@@ -351,7 +349,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
             final int neighbourLevel = this.getLightLevel(sectionIndex, localIndex);
 
             final int absorption = sidedTransparent
-                    ? (FaceOcclusion.isFaceSolid(centerBlock, meta, direction.ordinal()) ? Math.max(1, rawOpacity) : 1)
+                    ? (FaceOcclusion.isFaceSolid(bits, centerBlock, meta, direction.ordinal()) ? Math.max(1, rawOpacity) : 1)
                     : uniformAbsorption;
             final int attenuated = neighbourLevel - absorption;
             if (attenuated > level) {
@@ -376,8 +374,9 @@ public class ScalarSkyEngine extends SupernovaEngine {
         final ExtendedBlockStorage[] sections = chunk.getBlockStorageArray();
 
         int highestNonEmptySection = this.maxSection;
-        while (highestNonEmptySection >= this.minSection && (sections[highestNonEmptySection - this.minSection] == null || sections[highestNonEmptySection
-                - this.minSection].isEmpty())) {
+        while (highestNonEmptySection >= this.minSection
+            && (sections[highestNonEmptySection - this.minSection] == null
+                || ((ExtendedSection) sections[highestNonEmptySection - this.minSection]).supernova$hasNoBlocks())) {
             this.checkNullSection(chunkX, highestNonEmptySection, chunkZ, false);
 
             for (final AxisDirection direction : ONLY_HORIZONTAL_DIRECTIONS) {
@@ -476,21 +475,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
             final int propagatedLevel = (int) ((queueValue >>> LIGHT_LEVEL_SHIFT) & 0xF);
             final AxisDirection[] checkDirections = OLD_CHECK_DIRECTIONS[(int) ((queueValue >>> DIRECTION_SHIFT) & 63L)];
 
-            final boolean hasSidedTransparent = (queueValue & FLAG_HAS_SIDED_TRANSPARENT_BLOCKS) != 0L;
-            Block srcBlock = null;
-            int srcMeta = 0;
-            boolean checkSourceFaces = false;
-            if (hasSidedTransparent) {
-                final int srcIdx = (posX >> 4) + 5 * (posZ >> 4) + (5 * 5) * (posY >> 4) + sectionOffset;
-                srcBlock = this.getBlockFast(srcIdx, posX & 15, posY & 15, posZ & 15);
-                if (srcBlock != Blocks.air && FaceOcclusion.hasSidedTransparency(srcBlock)) {
-                    final ExtendedBlockStorage srcSection = this.sectionCache[srcIdx];
-                    if (srcSection != null) {
-                        srcMeta = srcSection.getExtBlockMetadata(posX & 15, posY & 15, posZ & 15);
-                    }
-                    checkSourceFaces = true;
-                }
-            }
+            final boolean checkSourceFaces = this.resolveSourceFaces(queueValue, posX, posY, posZ, sectionOffset);
 
             if ((queueValue & FLAG_RECHECK_LEVEL) != 0L) {
                 if (this.getLightLevel(posX, posY, posZ) != propagatedLevel) {
@@ -501,7 +486,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
             }
 
             for (final AxisDirection propagate : checkDirections) {
-                if (checkSourceFaces && FaceOcclusion.isFaceSolid(srcBlock, srcMeta, propagate.ordinal())) continue;
+                if (checkSourceFaces && this.isSourceFaceSolid(propagate.ordinal())) continue;
 
                 final int offX = posX + propagate.x;
                 final int offY = posY + propagate.y;
@@ -517,13 +502,14 @@ public class ScalarSkyEngine extends SupernovaEngine {
                 final int currentLevel = this.getLightLevel(sectionIndex, localIndex);
 
                 final Block destBlock = this.getBlockFast(sectionIndex, offX & 15, offY & 15, offZ & 15);
+                final int destId = this.lastBlockId;
                 final int absorption;
                 if (destBlock == Blocks.air) {
                     absorption = 1;
                 } else {
                     final ExtendedBlockStorage section = this.sectionCache[sectionIndex];
                     final int destMeta = section != null ? section.getExtBlockMetadata(offX & 15, offY & 15, offZ & 15) : 0;
-                    absorption = FaceOcclusion.resolveScalarAbsorption(destBlock, destMeta, propagate.oppositeOrdinal, offX, offY, offZ);
+                    absorption = FaceOcclusion.resolveScalarAbsorption(destId, destBlock, destMeta, propagate.oppositeOrdinal, offX, offY, offZ);
                 }
 
                 final int targetLevel = propagatedLevel - absorption;
@@ -531,8 +517,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
                     continue;
                 }
 
-                this.setLightLevel(offX, offY, offZ, targetLevel);
-                this.postLightUpdate(sectionIndex);
+                if (this.setLightLevelInCache(sectionIndex, localIndex, targetLevel)) this.postLightUpdate(sectionIndex, localIndex);
 
                 if (targetLevel > 1) {
                     if (queueLength >= queue.length) {
@@ -545,7 +530,7 @@ public class ScalarSkyEngine extends SupernovaEngine {
                     queue[queueLength++] = encodeCoords(offX, offZ, offY, encodeOffset)
                             | this.encodeQueueLevel(targetLevel)
                             | (propagate.everythingButTheOppositeDirection << DIRECTION_SHIFT)
-                            | sidedFlag(destBlock);
+                            | sidedFlag(destId);
                 }
             }
         }
@@ -575,24 +560,10 @@ public class ScalarSkyEngine extends SupernovaEngine {
             final int propagatedLevel = (int) ((queueValue >>> LIGHT_LEVEL_SHIFT) & 0xF);
             final AxisDirection[] checkDirections = OLD_CHECK_DIRECTIONS[(int) ((queueValue >>> DIRECTION_SHIFT) & 63)];
 
-            final boolean hasSidedTransparent = (queueValue & FLAG_HAS_SIDED_TRANSPARENT_BLOCKS) != 0L;
-            Block srcBlock = null;
-            int srcMeta = 0;
-            boolean checkSourceFaces = false;
-            if (hasSidedTransparent) {
-                final int srcIdx = (posX >> 4) + 5 * (posZ >> 4) + (5 * 5) * (posY >> 4) + sectionOffset;
-                srcBlock = this.getBlockFast(srcIdx, posX & 15, posY & 15, posZ & 15);
-                if (srcBlock != Blocks.air && FaceOcclusion.hasSidedTransparency(srcBlock)) {
-                    final ExtendedBlockStorage srcSection = this.sectionCache[srcIdx];
-                    if (srcSection != null) {
-                        srcMeta = srcSection.getExtBlockMetadata(posX & 15, posY & 15, posZ & 15);
-                    }
-                    checkSourceFaces = true;
-                }
-            }
+            final boolean checkSourceFaces = this.resolveSourceFaces(queueValue, posX, posY, posZ, sectionOffset);
 
             for (final AxisDirection propagate : checkDirections) {
-                if (checkSourceFaces && FaceOcclusion.isFaceSolid(srcBlock, srcMeta, propagate.ordinal())) continue;
+                if (checkSourceFaces && this.isSourceFaceSolid(propagate.ordinal())) continue;
 
                 final int offX = posX + propagate.x;
                 final int offY = posY + propagate.y;
@@ -609,23 +580,24 @@ public class ScalarSkyEngine extends SupernovaEngine {
                 if (currentLevel == 0) {
                     continue;
                 }
-                // Full sky light (15) is a sky source -- immutable during decrease
+                // 15 is a sky source: immutable during decrease.
                 if (currentLevel == 15) {
                     continue;
                 }
 
                 final Block block = this.getBlockFast(sectionIndex, offX & 15, offY & 15, offZ & 15);
+                final int destId = this.lastBlockId;
                 final int absorption;
                 if (block == Blocks.air) {
                     absorption = 1;
                 } else {
                     final ExtendedBlockStorage section = this.sectionCache[sectionIndex];
                     final int destMeta = section != null ? section.getExtBlockMetadata(offX & 15, offY & 15, offZ & 15) : 0;
-                    absorption = FaceOcclusion.resolveScalarAbsorption(block, destMeta, propagate.oppositeOrdinal, offX, offY, offZ);
+                    absorption = FaceOcclusion.resolveScalarAbsorption(destId, block, destMeta, propagate.oppositeOrdinal, offX, offY, offZ);
                 }
 
                 final int targetLevel = propagatedLevel - absorption;
-                final long sFlag = sidedFlag(block);
+                final long sFlag = sidedFlag(destId);
 
                 if (currentLevel > targetLevel) {
                     // This block has another source -- re-propagate with RECHECK
@@ -644,11 +616,9 @@ public class ScalarSkyEngine extends SupernovaEngine {
                     continue;
                 }
 
-                // Clear this block and continue decrease
-                this.setLightLevel(offX, offY, offZ, 0);
-                this.postLightUpdate(sectionIndex);
+                if (this.setLightLevelInCache(sectionIndex, localIndex, 0)) this.postLightUpdate(sectionIndex, localIndex);
 
-                // Sky light has no per-block emission -- just continue decrease
+                // Sky light has no per-block emission to re-apply.
                 if (currentLevel > 1) {
                     if (queueLength >= queue.length) {
                         if (queue.length >= MAX_QUEUE_SIZE) {
@@ -670,19 +640,4 @@ public class ScalarSkyEngine extends SupernovaEngine {
         this.performLightIncrease();
     }
 
-
-    @Override
-    protected void onNibbleVisible(final int cacheIndex, final SWMRNibbleArray nibble) {
-        if (nibble == null) return;
-        final int cy = cacheIndex / 25;
-        final int sectionY = cy - this.chunkOffsetY;
-        if (sectionY < this.minSection || sectionY > this.maxSection) return;
-        final ExtendedBlockStorage section = this.sectionCache[cacheIndex];
-        if (section == null) return;
-        final byte[] srcData = nibble.getVisibleData();
-        if (srcData == null) return;
-        final net.minecraft.world.chunk.NibbleArray vanilla = section.getSkylightArray();
-        if (vanilla == null) return;
-        System.arraycopy(srcData, 0, vanilla.data, 0, srcData.length);
-    }
 }

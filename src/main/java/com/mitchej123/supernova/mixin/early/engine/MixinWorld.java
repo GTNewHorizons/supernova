@@ -1,8 +1,11 @@
 package com.mitchej123.supernova.mixin.early.engine;
 
+import com.mitchej123.supernova.Supernova;
 import com.mitchej123.supernova.api.ExtendedChunk;
+import com.mitchej123.supernova.light.LightRegistries;
 import com.mitchej123.supernova.light.WorldLightManager;
 import com.mitchej123.supernova.world.SupernovaWorld;
+import net.minecraft.block.Block;
 import net.minecraft.world.EnumSkyBlock;
 import net.minecraft.world.World;
 import net.minecraft.world.WorldProvider;
@@ -16,6 +19,7 @@ import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
 import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 
 @Mixin(World.class)
 public abstract class MixinWorld implements SupernovaWorld {
@@ -27,15 +31,14 @@ public abstract class MixinWorld implements SupernovaWorld {
     @Unique
     private WorldLightManager supernova$lightInterface;
 
-    /**
-     * Set after the World constructor returns. Prevents dispatching to Supernova during the constructor body, when the world isn't fully initialized yet.
-     */
+    @Unique
+    private volatile boolean supernova$lightShutDown;
+    @Unique
+    private boolean supernova$warnedAfterShutdown;
+
+    /** Set at constructor RETURN; dispatching from the constructor body would touch a half-built world. */
     @Unique
     private boolean supernova$ready;
-
-    /** True while a player-initiated block place/break is in progress (client main thread only). */
-    @Unique
-    private boolean supernova$playerAction;
 
     @Inject(method = "<init>*", at = @At("RETURN"))
     private void supernova$onWorldInit(CallbackInfo ci) {
@@ -52,35 +55,38 @@ public abstract class MixinWorld implements SupernovaWorld {
     }
 
     @Override
-    public boolean supernova$hasChunkPendingLight(int cx, int cz) {
-        final WorldLightManager iface = this.supernova$lightInterface;
-        return iface != null && iface.hasChunkPendingLight(cx, cz);
-    }
-
-    @Override
     public void supernova$shutdown() {
         if (this.supernova$lightInterface != null) {
             this.supernova$lightInterface.shutdown();
             this.supernova$lightInterface = null;
         }
-    }
-
-    @Override
-    public void supernova$setPlayerAction(boolean value) {
-        this.supernova$playerAction = value;
-    }
-
-    @Override
-    public boolean supernova$isPlayerAction() {
-        return this.supernova$playerAction;
+        this.supernova$lightShutDown = true;
     }
 
     @Override
     public WorldLightManager supernova$getLightManager() {
+        if (this.supernova$lightShutDown) {
+            if (!this.supernova$warnedAfterShutdown) {
+                this.supernova$warnedAfterShutdown = true;
+                Supernova.LOG.warn("Light manager requested after shutdown, dim {}", this.provider.dimensionId);
+            }
+            return null;
+        }
         if (this.supernova$lightInterface == null && this.provider != null) {
             this.supernova$lightInterface = new WorldLightManager((World) (Object) this, !this.provider.hasNoSky, true);
         }
         return this.supernova$lightInterface;
+    }
+
+    @Override
+    public WorldLightManager supernova$lightManagerIfPresent() {
+        return this.supernova$lightInterface;
+    }
+
+    @Override
+    public boolean supernova$hasChunkPendingLight(final int chunkX, final int chunkZ) {
+        final WorldLightManager iface = this.supernova$lightInterface;
+        return iface != null && iface.hasChunkPendingLight(chunkX, chunkZ);
     }
 
     @Inject(method = "updateEntities", at = @At("HEAD"))
@@ -88,15 +94,20 @@ public abstract class MixinWorld implements SupernovaWorld {
         if (((World) (Object) this).isRemote) {
             final WorldLightManager iface = this.supernova$lightInterface;
             if (iface != null) {
-                iface.processClientRenderUpdates();
+                iface.drainClientLight();
             }
         }
     }
 
+    @Inject(method = "updateEntities", at = @At("RETURN"))
+    private void supernova$refreshDynamicEmission(CallbackInfo ci) {
+        final WorldLightManager iface = this.supernova$lightInterface;
+        if (iface != null) iface.refreshDynamicEmission();
+    }
+
     /**
      * @author Supernova
-     * @reason Replace vanilla BFS light propagation with Supernova engine dispatch. Both client and server enqueue to LightQueue for async worker processing.
-     * Client calls scheduleUpdate() immediately to minimize visual latency.
+     * @reason Replaced by Supernova engine dispatch; both sides enqueue to LightQueue
      */
     @Overwrite
     public boolean updateLightByType(EnumSkyBlock type, int x, int y, int z) {
@@ -104,57 +115,50 @@ public abstract class MixinWorld implements SupernovaWorld {
         final WorldLightManager iface = this.supernova$getLightManager();
         if (iface == null) return false;
 
-        if (!((World) (Object) this).isRemote) {
-            // Server: enqueue -- worker runs both engines for the position.
-            iface.queueBlockChange(x, y, z);
-            return true;
-        }
-
-        // Client: player actions run BFS synchronously for instant feedback;
-        // server-sent changes (explosions, pistons, etc.) go async to avoid stalls.
-        final Chunk chunk = this.supernova$getAnyChunkImmediately(x >> 4, z >> 4);
-        if (chunk == null || !((ExtendedChunk) chunk).isLightReady()) {
-            return false;
-        }
-        if (this.supernova$playerAction) {
-            iface.blockChange(x, y, z);
-        } else {
-            iface.queueBlockChange(x, y, z);
-            iface.scheduleUpdate();
-        }
-        return true;
+        return this.supernova$queueBlockChange(iface, x, y, z);
     }
 
     /**
      * @author Supernova
-     * @reason Dispatch checkLight (called from World.setBlock) to Supernova engines. Server enqueues to LightQueue; client dispatches sync for player actions,
-     * async otherwise.
+     * @reason Dispatch checkLight to the Supernova engines on both sides
      */
     @Overwrite
     public boolean func_147451_t(int x, int y, int z) {
         if (!this.supernova$ready) return false;
         final WorldLightManager iface = this.supernova$getLightManager();
         if (iface == null) return false;
+        this.supernova$queueBlockChange(iface, x, y, z);
+        return true;
+    }
 
+    /** Client work is drained on the main thread before this tick's frame, so a player edit is lit in the same frame. */
+    @Unique
+    private boolean supernova$queueBlockChange(final WorldLightManager iface, final int x, final int y, final int z) {
         if (!((World) (Object) this).isRemote) {
             iface.queueBlockChange(x, y, z);
             return true;
         }
-
         final Chunk chunk = this.supernova$getAnyChunkImmediately(x >> 4, z >> 4);
-        if (chunk == null || !((ExtendedChunk) chunk).isLightReady()) {
-            return true;
+        if (chunk == null || !((ExtendedChunk) chunk).isLightUsable()) {
+            return false;
         }
-        if (this.supernova$playerAction) {
-            iface.blockChange(x, y, z);
-        } else {
-            iface.queueBlockChange(x, y, z);
-            iface.scheduleUpdate();
-        }
+        iface.queueBlockChange(x, y, z);
         return true;
     }
 
-    // Kill the random per-tick playerCheckLight fixup in setActivePlayerChunksAndCheckLight.
+    /** Vanilla makes no light call on a metadata-only write, so a block whose emission or absorption depends on metadata would never reach the engine. */
+    @Inject(method = "setBlockMetadataWithNotify", at = @At("RETURN"))
+    private void supernova$onMetadataChanged(int x, int y, int z, int meta, int flags, CallbackInfoReturnable<Boolean> cir) {
+        if (!cir.getReturnValueZ() || !this.supernova$ready) return;
+        final WorldLightManager iface = this.supernova$getLightManager();
+        if (iface == null) return;
+        final Block block = ((World) (Object) this).getBlock(x, y, z);
+        if (LightRegistries.metaAffectsLight(Block.getIdFromBlock(block))) {
+            this.supernova$queueBlockChange(iface, x, y, z);
+        }
+    }
+
+    // Kills vanilla's random per-tick playerCheckLight fixup.
     @Redirect(method = "setActivePlayerChunksAndCheckLight", at = @At(value = "INVOKE", target = "Lnet/minecraft/world/World;func_147451_t(III)Z"))
     private boolean supernova$skipPlayerCheckLight(World world, int x, int y, int z) {
         return true;

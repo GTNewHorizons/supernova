@@ -9,9 +9,7 @@ import java.io.File;
 import java.io.FileReader;
 import java.io.IOException;
 
-/**
- * Shared parser for block config files using the {@code modid:name[:meta] = r, g, b} format.
- */
+/** Parses {@code modid:name[:meta] = r, g, b}; meta may be {@code *} for all metas. */
 final class BlockConfigParser {
 
     @FunctionalInterface
@@ -49,7 +47,6 @@ final class BlockConfigParser {
         final String blockSpec = halves[0].trim();
         final String rgbSpec = halves[1].trim();
 
-        // Parse RGB
         final String[] rgbParts = rgbSpec.split(",");
         if (rgbParts.length != 3) {
             warn(fileName, lineNum, "expected 3 comma-separated values", rgbSpec);
@@ -69,7 +66,6 @@ final class BlockConfigParser {
             return false;
         }
 
-        // Parse block spec: modid:name or modid:name:meta
         final int firstColon = blockSpec.indexOf(':');
         if (firstColon <= 0) {
             warn(fileName, lineNum, "invalid block id (expected modid:name)", blockSpec);

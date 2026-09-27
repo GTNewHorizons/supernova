@@ -1,72 +1,86 @@
 package com.mitchej123.supernova.light.engine;
 
 import com.mitchej123.supernova.light.SWMRNibbleArray;
+import com.mitchej123.supernova.util.SnapshotChunkMap;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 
-/**
- * Test subclass of SupernovaSkyEngine that exposes internals for cache population and assertions.
- */
-class TestableSkyEngine extends SupernovaSkyEngine {
+class TestableSkyEngine extends SupernovaSkyEngine implements RGBEngineAccess {
 
     TestableSkyEngine(World world) {
-        super(world);
-        this.suppressRenderNotify = true;
+        super(world, new SnapshotChunkMap());
     }
 
-    SWMRNibbleArray[] getNibbleCacheR() {
+    @Override
+    protected void markRenderSection(int originX, int originY, int originZ) {}
+
+    @Override
+    public SWMRNibbleArray[] getNibbleCacheR() {
         return this.nibbleCacheR;
     }
 
-    SWMRNibbleArray[] getNibbleCacheG() {
+    @Override
+    public SWMRNibbleArray[] getNibbleCacheG() {
         return this.nibbleCacheG;
     }
 
-    SWMRNibbleArray[] getNibbleCacheB() {
+    @Override
+    public SWMRNibbleArray[] getNibbleCacheB() {
         return this.nibbleCacheB;
     }
 
-    ExtendedBlockStorage[] getSectionCache() {
+    @Override
+    public ExtendedBlockStorage[] getSectionCache() {
         return this.sectionCache;
     }
 
-    SWMRNibbleArray[] getNibbleCache() {
+    @Override
+    public SWMRNibbleArray[] getNibbleCache() {
         return this.nibbleCache;
     }
 
-    int getChunkSectionIndexOffset() {
+    @Override
+    public int getChunkSectionIndexOffset() {
         return this.chunkSectionIndexOffset;
     }
 
-    int getCoordinateOffset() {
+    @Override
+    public int getCoordinateOffset() {
         return this.coordinateOffset;
     }
 
-    void callSetupEncodeOffset(int centerX, int centerY, int centerZ) {
+    @Override
+    public void callSetupEncodeOffset(int centerX, int centerY, int centerZ) {
         this.setupEncodeOffset(centerX, centerY, centerZ);
     }
 
-    void callPerformLightIncrease() {
+    @Override
+    public void callPerformLightIncrease() {
         this.performLightIncrease();
     }
 
-    void callPerformLightDecrease() {
+    @Override
+    public void callPerformLightDecrease() {
         this.performLightDecrease();
     }
 
-    void enqueueIncrease(long value) {
+    @Override
+    public void enqueueIncrease(long value) {
         this.appendToIncreaseQueue(value);
     }
 
-    void enqueueDecrease(long value) {
+    @Override
+    public void enqueueDecrease(long value) {
         this.appendToDecreaseQueue(value);
     }
 
-    int getLightAt(int worldX, int worldY, int worldZ) {
+    @Override
+    public int getLightAt(int worldX, int worldY, int worldZ) {
         return this.getLightLevel(worldX, worldY, worldZ);
     }
 
-    void setLightAt(int worldX, int worldY, int worldZ, int packedRGB) {
+    @Override
+    public void setLightAt(int worldX, int worldY, int worldZ, int packedRGB) {
         this.setLightLevel(worldX, worldY, worldZ, packedRGB);
     }
 }

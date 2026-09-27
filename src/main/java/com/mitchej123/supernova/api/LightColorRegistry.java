@@ -2,12 +2,12 @@ package com.mitchej123.supernova.api;
 
 import com.mitchej123.supernova.Supernova;
 import com.mitchej123.supernova.config.SupernovaConfig;
-import cpw.mods.fml.common.registry.GameData;
 import net.minecraft.block.Block;
 import net.minecraft.world.IBlockAccess;
 
 import java.util.Arrays;
-import java.util.BitSet;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 
 /**
@@ -25,16 +25,25 @@ import java.util.function.BiConsumer;
  */
 public final class LightColorRegistry {
 
-    // packed+1 per meta (0 = unregistered). length==1 -> wildcard for all metas. Indexed by block ID.
-    private static int[][] REGISTRY_BY_ID = new int[0][];
-    private static final BitSet HAS_ENTRY = new BitSet();
+    private static final BlockIdIndex REGISTRY = new BlockIdIndex();
     private static final int[] WHITE_BY_LEVEL = new int[16];
 
-    /** Flat emission cache indexed by blockId. UNCACHEABLE for positional/interface blocks. */
-    private static int[] EMISSION_CACHE = new int[0];
-    /** Per-meta emission cache. Non-null entries hold meta 0-15 packed values. */
-    private static int[][] EMISSION_CACHE_PER_META = new int[0][];
+    private static volatile BlockIdIndex.Cache EMISSION_CACHE = BlockIdIndex.Cache.EMPTY;
+    private static volatile boolean[] POSITIONAL_CACHE = new boolean[0];
     private static final int UNCACHEABLE = -1;
+    private static final Set<Class<?>> POSITIONAL_LIGHT_FAILED = ConcurrentHashMap.newKeySet();
+    private static final ClassValue<Boolean> POSITIONAL_CLASS = new ClassValue<>() {
+        @Override
+        protected Boolean computeValue(final Class<?> type) {
+            try {
+                return type.getMethod("getLightValue", IBlockAccess.class, int.class, int.class, int.class).getDeclaringClass() != Block.class;
+            } catch (final NoSuchMethodException e) {
+                return false;
+            } catch (final LinkageError e) {
+                return true;
+            }
+        }
+    };
 
     static {
         for (int i = 0; i < 16; i++) {
@@ -50,8 +59,7 @@ public final class LightColorRegistry {
      * @param block block to check
      */
     public static boolean hasExplicitEntry(Block block) {
-        final int id = Block.getIdFromBlock(block);
-        return id >= 0 && HAS_ENTRY.get(id);
+        return REGISTRY.hasEntry(Block.getIdFromBlock(block));
     }
 
     /**
@@ -60,7 +68,23 @@ public final class LightColorRegistry {
      * @param blockId numeric block ID
      */
     public static boolean hasExplicitEntry(int blockId) {
-        return blockId >= 0 && HAS_ENTRY.get(blockId);
+        return REGISTRY.hasEntry(blockId);
+    }
+
+    /** Returns true only for explicit per-meta entries. */
+    public static boolean isMetaSensitive(int blockId) {
+        return REGISTRY.isMetaSensitive(blockId);
+    }
+
+    /** Includes overrides of positional {@code getLightValue}, not just {@link PositionalColoredLightSource}. */
+    public static boolean isPositional(final Block block) {
+        return block instanceof PositionalColoredLightSource || POSITIONAL_CLASS.get(block.getClass());
+    }
+
+    /** Positional status from the most recent {@link #buildCache()}. */
+    public static boolean isPositional(final int blockId) {
+        final boolean[] cache = POSITIONAL_CACHE;
+        return blockId >= 0 && blockId < cache.length && cache[blockId];
     }
 
     /**
@@ -94,25 +118,7 @@ public final class LightColorRegistry {
      * @param b     blue channel (0-15)
      */
     public static void register(Block block, int meta, int r, int g, int b) {
-        if (meta < 0) {
-            throw new IllegalArgumentException("meta must be >= 0, got " + meta);
-        }
-        final int id = Block.getIdFromBlock(block);
-        ensureCapacity(id);
-        int[] entry = REGISTRY_BY_ID[id];
-        if (entry == null) {
-            entry = new int[Math.max(meta + 1, 16)];
-        } else if (entry.length == 1) {
-            // Expand wildcard to per-meta array
-            final int wildcard = entry[0];
-            entry = new int[Math.max(meta + 1, 16)];
-            Arrays.fill(entry, wildcard);
-        } else if (meta >= entry.length) {
-            entry = Arrays.copyOf(entry, meta + 1);
-        }
-        entry[meta] = scaleToVanillaLight(PackedColorLight.pack(r, g, b), block.getLightValue()) + 1; // +1 so 0 = unregistered
-        REGISTRY_BY_ID[id] = entry;
-        markEntry(block);
+        REGISTRY.putMeta(block, meta, scaleToVanillaLight(PackedColorLight.pack(r, g, b), block.getLightValue()) + 1);
     }
 
     /**
@@ -124,68 +130,77 @@ public final class LightColorRegistry {
      * @param b     blue channel (0-15)
      */
     public static void register(Block block, int r, int g, int b) {
-        final int id = Block.getIdFromBlock(block);
-        ensureCapacity(id);
-        REGISTRY_BY_ID[id] = new int[] { scaleToVanillaLight(PackedColorLight.pack(r, g, b), block.getLightValue()) + 1 };
-        markEntry(block);
+        REGISTRY.put(block, new int[] { scaleToVanillaLight(PackedColorLight.pack(r, g, b), block.getLightValue()) + 1 });
     }
 
     /**
-     * Resolve the packed RGB emission for a block at a position.
+     * Resolves emission at a position. Positional queries that throw fall back to metadata-only
+     * emission or static light.
      *
      * @param world block access for positional queries
      * @param block block instance
-     * @param meta  block metadata
-     * @param x     block x
-     * @param y     block y
-     * @param z     block z
-     * @return packed RGB via {@link PackedColorLight#pack}, or 0 if no emission
+     * @param meta block metadata
+     * @param x block x
+     * @param y block y
+     * @param z block z
+     * @return packed RGB, or 0 for no emission
      */
     public static int getPackedEmission(IBlockAccess world, Block block, int meta, int x, int y, int z) {
         if (block instanceof PositionalColoredLightSource) {
-            return ((PositionalColoredLightSource) block).getColoredLightEmission(world, meta, x, y, z);
+            if (!(world instanceof net.minecraft.world.World) && POSITIONAL_LIGHT_FAILED.contains(block.getClass())) {
+                return ((ColoredLightSource) block).getColoredLightEmission(meta);
+            }
+            try {
+                return ((PositionalColoredLightSource) block).getColoredLightEmission(world, meta, x, y, z);
+            } catch (final RuntimeException e) {
+                if (!(world instanceof net.minecraft.world.World) && POSITIONAL_LIGHT_FAILED.add(block.getClass())) {
+                    Supernova.LOG.warn("{} positional colored emission threw off-thread; using non-positional emission", block.getClass().getName(), e);
+                }
+                return ((ColoredLightSource) block).getColoredLightEmission(meta);
+            }
         }
         if (block instanceof ColoredLightSource) {
             return ((ColoredLightSource) block).getColoredLightEmission(meta);
         }
 
-        // EasyColoredLights auto-detect
-        final int rawLight = block.getLightValue(world, x, y, z);
+        // A worker's SafeBlockAccess has no tile entities; real-world samples still retry a class that failed there.
+        int rawLight;
+        if (!(world instanceof net.minecraft.world.World) && !POSITIONAL_LIGHT_FAILED.isEmpty() && POSITIONAL_LIGHT_FAILED.contains(block.getClass())) {
+            rawLight = block.getLightValue();
+        } else {
+            try {
+                rawLight = block.getLightValue(world, x, y, z);
+            } catch (final RuntimeException e) {
+                if (!(world instanceof net.minecraft.world.World) && POSITIONAL_LIGHT_FAILED.add(block.getClass())) {
+                    Supernova.LOG.warn("{} getLightValue(world, x, y, z) threw off-thread; using static light value", block.getClass().getName(), e);
+                }
+                rawLight = block.getLightValue();
+            }
+        }
+        return resolve(block, rawLight, meta);
+    }
+
+    private static int resolve(final Block block, final int rawLight, final int meta) {
         if (rawLight > 15) {
             final int ecl = decodeECL(rawLight);
             if (ecl != 0) return ecl;
         }
-
-        final int blockId = Block.getIdFromBlock(block);
-        if (blockId >= 0 && blockId < REGISTRY_BY_ID.length) {
-            final int[] entry = REGISTRY_BY_ID[blockId];
-            if (entry != null) {
-                final int result = lookupRegistry(entry, meta);
-                if (result >= 0) return result;
-            }
-        }
-
-        // Vanilla fallback
+        final int registered = REGISTRY.lookup(Block.getIdFromBlock(block), meta);
+        if (registered >= 0) return registered;
         final int vanillaLight = rawLight & 0xF;
         return vanillaLight > 0 ? WHITE_BY_LEVEL[vanillaLight] : 0;
     }
 
     /**
-     * Fast-path emission lookup using the flat cache. Falls back to full lookup on UNCACHEABLE.
+     * Cache miss falls back to {@link #getPackedEmissionNoWorld(Block, int)}, never positional lookup.
      *
      * @param blockId numeric block ID
-     * @param block   block instance
-     * @param meta    block metadata
-     * @return packed RGB via {@link PackedColorLight#pack}, or 0 if no emission
+     * @param meta block metadata
+     * @return packed RGB, or 0 for no emission
      */
-    public static int getPackedEmissionCached(int blockId, Block block, int meta) {
-        if (blockId >= 0 && blockId < EMISSION_CACHE.length) {
-            final int cached = EMISSION_CACHE[blockId];
-            if (cached != UNCACHEABLE) return cached;
-            final int[] perMeta = EMISSION_CACHE_PER_META[blockId];
-            if (perMeta != null && meta >= 0 && meta < perMeta.length) return perMeta[meta];
-        }
-        return getPackedEmissionNoWorld(block, meta);
+    public static int getPackedEmissionCached(int blockId, int meta) {
+        final int cached = EMISSION_CACHE.lookup(blockId, meta, UNCACHEABLE);
+        return cached != UNCACHEABLE ? cached : getPackedEmissionNoWorld(Block.getBlockById(blockId), meta);
     }
 
     /**
@@ -201,36 +216,7 @@ public final class LightColorRegistry {
             return ((ColoredLightSource) block).getColoredLightEmission(meta);
         }
 
-        // EasyColoredLights auto-detect
-        final int rawLight = block.getLightValue();
-        if (rawLight > 15) {
-            final int ecl = decodeECL(rawLight);
-            if (ecl != 0) return ecl;
-        }
-
-        final int blockId = Block.getIdFromBlock(block);
-        if (blockId >= 0 && blockId < REGISTRY_BY_ID.length) {
-            final int[] entry = REGISTRY_BY_ID[blockId];
-            if (entry != null) {
-                final int result = lookupRegistry(entry, meta);
-                if (result >= 0) return result;
-            }
-        }
-
-        final int vanillaLight = rawLight & 0xF;
-        return vanillaLight > 0 ? WHITE_BY_LEVEL[vanillaLight] : 0;
-    }
-
-    // Values stored as packed+1 so 0 can represent "unregistered".
-
-    /** @return packed emission, or -1 if not found */
-    private static int lookupRegistry(final int[] entry, final int meta) {
-        if (entry.length == 1) return entry[0] - 1;
-        if (meta >= 0 && meta < entry.length) {
-            final int v = entry[meta];
-            if (v != 0) return v - 1;
-        }
-        return -1;
+        return resolve(block, block.getLightValue(), meta);
     }
 
     /**
@@ -240,43 +226,41 @@ public final class LightColorRegistry {
      * {@code PackedColorLight.red/green/blue(value - 1)}.
      */
     public static void forEach(BiConsumer<Block, int[]> consumer) {
-        for (int id = HAS_ENTRY.nextSetBit(0); id >= 0; id = HAS_ENTRY.nextSetBit(id + 1)) {
-            if (id >= REGISTRY_BY_ID.length) break;
-            final int[] entry = REGISTRY_BY_ID[id];
-            if (entry == null) continue;
-            final Block block = Block.getBlockById(id);
-            if (block != null) consumer.accept(block, entry);
-        }
+        REGISTRY.forEach(consumer);
     }
 
-    /**
-     * Build flat emission caches. Call at PostInit after all registrations.
-     */
+    /** Reindexes registrations after block IDs change; follow with {@link #buildCache()}. */
+    public static void rebuildIdMappings() {
+        REGISTRY.rebuild();
+    }
+
+    /** Rebuild after registrations or ID remapping, on the main thread outside lighting queries. */
     @SuppressWarnings("unchecked")
     public static void buildCache() {
         int maxId = 0;
-        for (final Block block : (Iterable<Block>) GameData.getBlockRegistry()) {
+        for (final Block block : (Iterable<Block>) Block.blockRegistry) {
             final int bid = Block.getIdFromBlock(block);
             if (bid > maxId) maxId = bid;
         }
 
-        EMISSION_CACHE = new int[maxId + 1];
-        EMISSION_CACHE_PER_META = new int[maxId + 1][];
-        Arrays.fill(EMISSION_CACHE, UNCACHEABLE);
+        final int[] emissionCache = new int[maxId + 1];
+        final int[][] emissionCachePerMeta = new int[maxId + 1][];
+        final boolean[] positionalCache = new boolean[maxId + 1];
+        Arrays.fill(emissionCache, UNCACHEABLE);
 
         int cachedUniform = 0, cachedPerMeta = 0;
 
-        for (final Block block : (Iterable<Block>) GameData.getBlockRegistry()) {
+        for (final Block block : (Iterable<Block>) Block.blockRegistry) {
             final int bid = Block.getIdFromBlock(block);
             if (bid < 0) continue;
+            positionalCache[bid] = isPositional(block);
 
-            // PositionalColoredLightSource -- uncacheable (needs world + pos)
+            // uncacheable: needs world + pos
             if (block instanceof PositionalColoredLightSource) {
-                EMISSION_CACHE[bid] = UNCACHEABLE;
+                emissionCache[bid] = UNCACHEABLE;
                 continue;
             }
 
-            // Static ColoredLightSource -- probe meta 0-15, cache if possible
             if (block instanceof ColoredLightSource src) {
                 final int meta0 = src.getColoredLightEmission(0);
                 boolean allSame = true;
@@ -287,70 +271,42 @@ public final class LightColorRegistry {
                     }
                 }
                 if (allSame) {
-                    EMISSION_CACHE[bid] = meta0;
+                    emissionCache[bid] = meta0;
                     cachedUniform++;
                 } else {
                     final int[] perMeta = new int[16];
                     perMeta[0] = meta0;
                     for (int m = 1; m < 16; m++) perMeta[m] = src.getColoredLightEmission(m);
-                    EMISSION_CACHE[bid] = UNCACHEABLE;
-                    EMISSION_CACHE_PER_META[bid] = perMeta;
+                    emissionCache[bid] = UNCACHEABLE;
+                    emissionCachePerMeta[bid] = perMeta;
                     cachedPerMeta++;
                 }
                 continue;
             }
 
-            // Explicit registry entry
-            final int[] entry = (bid < REGISTRY_BY_ID.length) ? REGISTRY_BY_ID[bid] : null;
-            if (entry != null) {
-                if (entry.length == 1) {
-                    // Wildcard -- uniform
-                    EMISSION_CACHE[bid] = entry[0] - 1;
-                    cachedUniform++;
-                } else {
-                    // Per-meta registry -- probe for uniformity first
-                    final int firstVal = (entry.length > 0 && entry[0] != 0) ? entry[0] - 1 : 0;
-                    boolean allSame = true;
-                    boolean hasPerMeta = firstVal != 0;
-                    for (int m = 1; m < 16; m++) {
-                        final int result = (m < entry.length && entry[m] != 0) ? entry[m] - 1 : 0;
-                        if (result != firstVal) {
-                            allSame = false;
-                            break;
-                        }
-                        if (result != 0) hasPerMeta = true;
-                    }
-                    if (allSame) {
-                        EMISSION_CACHE[bid] = firstVal;
-                        cachedUniform++;
-                    } else {
-                        final int[] perMeta = new int[16];
-                        perMeta[0] = firstVal;
-                        for (int m = 1; m < 16; m++) {
-                            perMeta[m] = (m < entry.length && entry[m] != 0) ? entry[m] - 1 : 0;
-                        }
-                        EMISSION_CACHE[bid] = UNCACHEABLE;
-                        EMISSION_CACHE_PER_META[bid] = perMeta;
-                        cachedPerMeta++;
-                    }
-                }
-                continue;
+            final int[] entry = REGISTRY.entryFor(bid);
+            // Metas past 15 are only reachable through the direct path.
+            final boolean metasPast15 = entry != null && entry.length > 16;
+            final int first = getPackedEmissionNoWorld(block, 0);
+            final int[] perMeta = new int[16];
+            perMeta[0] = first;
+            boolean allSame = true;
+            for (int m = 1; m < 16; m++) {
+                perMeta[m] = getPackedEmissionNoWorld(block, m);
+                if (perMeta[m] != first) allSame = false;
             }
-
-            // EasyColoredLights auto-detect / vanilla fallback
-            final int rawLight = block.getLightValue();
-            if (rawLight > 15) {
-                final int ecl = decodeECL(rawLight);
-                if (ecl != 0) {
-                    EMISSION_CACHE[bid] = ecl;
-                    cachedUniform++;
-                    continue;
-                }
+            if (allSame && !metasPast15) {
+                emissionCache[bid] = first;
+                cachedUniform++;
+            } else {
+                emissionCache[bid] = UNCACHEABLE;
+                emissionCachePerMeta[bid] = perMeta;
+                cachedPerMeta++;
             }
-            final int vanillaLight = rawLight & 0xF;
-            EMISSION_CACHE[bid] = vanillaLight > 0 ? WHITE_BY_LEVEL[vanillaLight] : 0;
-            cachedUniform++;
         }
+
+        EMISSION_CACHE = new BlockIdIndex.Cache(emissionCache, emissionCachePerMeta);
+        POSITIONAL_CACHE = positionalCache;
 
         Supernova.LOG.info("LightColorRegistry: cached emission for {} uniform + {} per-meta blocks", cachedUniform, cachedPerMeta);
     }
@@ -363,7 +319,7 @@ public final class LightColorRegistry {
      * {@link PackedColorLight#pack} format. Returns 0 if the value is not valid ECL or has no RGB channels.
      */
     private static int decodeECL(int eclValue) {
-        if ((eclValue & ECL_SPACER_MASK) != 0) return 0; // not valid ECL format
+        if ((eclValue & ECL_SPACER_MASK) != 0) return 0;
         final int r = (eclValue >>> 5) & 0xF;
         final int g = (eclValue >>> 10) & 0xF;
         final int b = (eclValue >>> 15) & 0xF;
@@ -390,14 +346,10 @@ public final class LightColorRegistry {
         return PackedColorLight.pack(nr, ng, nb);
     }
 
-    private static void markEntry(Block block) {
-        final int id = Block.getIdFromBlock(block);
-        if (id >= 0) HAS_ENTRY.set(id);
-    }
-
-    private static void ensureCapacity(int id) {
-        if (id >= 0 && id >= REGISTRY_BY_ID.length) {
-            REGISTRY_BY_ID = Arrays.copyOf(REGISTRY_BY_ID, Math.max(id + 1, REGISTRY_BY_ID.length * 2));
-        }
+    static void clearForTest() {
+        REGISTRY.clear();
+        EMISSION_CACHE = BlockIdIndex.Cache.EMPTY;
+        POSITIONAL_CACHE = new boolean[0];
+        POSITIONAL_LIGHT_FAILED.clear();
     }
 }

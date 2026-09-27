@@ -3,6 +3,7 @@ package com.mitchej123.supernova;
 import com.gtnewhorizon.gtnhlib.config.ConfigException;
 import com.gtnewhorizon.gtnhlib.config.ConfigurationManager;
 import com.mitchej123.supernova.client.TintBlendMode;
+import com.mitchej123.supernova.command.CommandSupernova;
 import com.mitchej123.supernova.compat.angelica.AngelicaCompat;
 import com.mitchej123.supernova.config.SupernovaClientConfig;
 import com.mitchej123.supernova.config.SupernovaConfig;
@@ -16,7 +17,9 @@ import cpw.mods.fml.common.gameevent.TickEvent;
 import net.minecraft.client.Minecraft;
 import net.minecraft.client.settings.KeyBinding;
 import net.minecraft.util.ChatComponentText;
+import net.minecraft.util.MathHelper;
 import net.minecraft.launchwrapper.Launch;
+import net.minecraftforge.client.ClientCommandHandler;
 import org.lwjgl.input.Keyboard;
 
 public class ClientProxy extends CommonProxy {
@@ -43,6 +46,8 @@ public class ClientProxy extends CommonProxy {
     public void init(FMLInitializationEvent event) {
         super.init(event);
 
+        ClientCommandHandler.instance.registerCommand(new CommandSupernova(this.configDir, true));
+
         tintModeKeyBinding = new KeyBinding("Cycle Tint Blend Mode", isDevEnvironment() ? Keyboard.KEY_BACKSLASH : Keyboard.KEY_NONE, "Supernova");
         ClientRegistry.registerKeyBinding(tintModeKeyBinding);
         FMLCommonHandler.instance().bus().register(this);
@@ -64,18 +69,29 @@ public class ClientProxy extends CommonProxy {
             SupernovaClientConfig.tintBlendMode = TintBlendMode.current;
             ConfigurationManager.save(SupernovaClientConfig.class);
 
-            // Sync to Angelica's TintRegistry if present
             if (angelicaLoaded) {
                 AngelicaCompat.syncTintMode();
             }
 
             if (Minecraft.getMinecraft().thePlayer != null) {
-                Minecraft.getMinecraft().thePlayer.addChatMessage(new ChatComponentText("§e[Supernova]§r Tint blend mode: §b"
+                Minecraft.getMinecraft().thePlayer.addChatMessage(new ChatComponentText("\u00a7e[Supernova]\u00a7r Tint blend mode: \u00a7b"
                         + TintBlendMode.current.name()));
             }
-            if (Minecraft.getMinecraft().renderGlobal != null) {
-                Minecraft.getMinecraft().renderGlobal.loadRenderers();
-            }
+            rebuildTintedGeometry();
+        }
+    }
+
+    private static void rebuildTintedGeometry() {
+        final Minecraft mc = Minecraft.getMinecraft();
+        if (mc.theWorld == null || mc.renderGlobal == null) return;
+        if (mc.thePlayer == null) return;
+        if (angelicaLoaded) {
+            AngelicaCompat.rebuildAllSections(mc.thePlayer.chunkCoordX, mc.thePlayer.chunkCoordZ);
+        } else {
+            final int px = MathHelper.floor_double(mc.thePlayer.posX);
+            final int pz = MathHelper.floor_double(mc.thePlayer.posZ);
+            final int r = mc.gameSettings.renderDistanceChunks * 16;
+            mc.renderGlobal.markBlockRangeForRenderUpdate(px - r, 0, pz - r, px + r, 255, pz + r);
         }
     }
 }

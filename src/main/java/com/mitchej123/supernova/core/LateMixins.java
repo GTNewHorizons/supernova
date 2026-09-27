@@ -6,7 +6,6 @@ import com.gtnewhorizon.gtnhmixins.builders.MixinBuilder;
 import javax.annotation.Nonnull;
 
 public enum LateMixins implements IMixins {
-    // Stub for now
     ;
 
     private final MixinBuilder builder;

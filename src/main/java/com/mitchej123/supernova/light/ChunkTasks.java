@@ -13,26 +13,32 @@ public final class ChunkTasks {
     public final long chunkCoordinate;
     public IntOpenHashSet changedPositions;
 
-    /**
-     * Per-section emptiness changes. Tri-state: {@code null} = no change, {@code TRUE} = empty, {@code FALSE} = non-empty.
-     */
+    /** Tri-state: null = no change, TRUE = empty, FALSE = non-empty. */
     public Boolean[] changedSectionSet;
 
-    /** Non-null if this chunk needs initial lighting. */
     public Chunk initialLightChunk;
     public Boolean[] initialLightEmptySections;
 
-    public IntOpenHashSet queuedEdgeChecksSky;
-    public IntOpenHashSet queuedEdgeChecksBlock;
+    /** One set, not one per lane: a LightQueue is bound to a single lane, so a sky task never carries block edge checks. */
+    public IntOpenHashSet queuedEdgeChecks;
 
-    public final SettableFuture<Void> onComplete;
+    /** Which relight this batch belongs to, 0 for ordinary work; on the task so a worker can test currency without the coordinator lock. */
+    public long lightGeneration;
+    /** false = propagation, true = edge reconciliation; only meaningful when lightGeneration is non-zero. */
+    public boolean edgePass;
 
     public final long enqueueTimeNs;
-    public int relightAttempts;
+    public int attempts;
+
+    public final SettableFuture<Void> onComplete = SettableFuture.create();
 
     public ChunkTasks(final long chunkCoordinate) {
         this.chunkCoordinate = chunkCoordinate;
-        this.onComplete = SettableFuture.create();
         this.enqueueTimeNs = System.nanoTime();
     }
+
+    boolean hasBlockChanges() {
+        return this.changedPositions != null && !this.changedPositions.isEmpty();
+    }
+
 }

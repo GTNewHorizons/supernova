@@ -1,7 +1,10 @@
 package com.mitchej123.supernova.light;
 
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -32,7 +35,6 @@ class SWMRNibbleArrayTest {
         SWMRNibbleArray arr = new SWMRNibbleArray();
         arr.set(3, 5, 7, 12);
         assertEquals(12, arr.getUpdating(3, 5, 7));
-        // Visible should still be 0 until updateVisible
         assertEquals(0, arr.getVisible(3, 5, 7));
     }
 
@@ -78,7 +80,6 @@ class SWMRNibbleArrayTest {
         assertTrue(arr.isInitialisedUpdating());
         arr.setHidden();
         assertTrue(arr.isHiddenUpdating());
-        // Data still accessible
         assertEquals(8, arr.getUpdating(5, 5, 5));
     }
 
@@ -112,7 +113,6 @@ class SWMRNibbleArrayTest {
     @Test
     void testAllPositions() {
         SWMRNibbleArray arr = new SWMRNibbleArray();
-        // Set a few specific positions and verify no cross-talk
         arr.set(0, 0, 0, 1);
         arr.set(15, 0, 0, 2);
         arr.set(0, 15, 0, 3);
@@ -149,38 +149,22 @@ class SWMRNibbleArrayTest {
         assertThrows(IllegalArgumentException.class, () -> new SWMRNibbleArray(new byte[100]));
     }
 
-    @Test
-    void testExtrudeLowerPreservesFullFlag() {
+    @ParameterizedTest(name = "full={0}")
+    @ValueSource(booleans = { true, false })
+    void testExtrudeLowerPreservesUniformFlag(boolean full) {
         SWMRNibbleArray source = new SWMRNibbleArray();
-        source.setFull();
-        assertTrue(source.isFullUpdating());
-        assertFalse(source.isZeroUpdating());
+        if (full) source.setFull();
+        else source.setZero();
+        assertEquals(full, source.isFullUpdating());
+        assertEquals(!full, source.isZeroUpdating());
 
         SWMRNibbleArray target = new SWMRNibbleArray();
         target.extrudeLower(source);
-        assertTrue(target.isFullUpdating(), "extrudeLower from full source should preserve fullFlag");
-        assertFalse(target.isZeroUpdating());
-        // Verify data is actually all 15
+        assertEquals(full, target.isFullUpdating(), "extrudeLower must preserve fullFlag");
+        assertEquals(!full, target.isZeroUpdating(), "extrudeLower must preserve zeroFlag");
+        final int expected = full ? 15 : 0;
         for (int i = 0; i < 4096; i++) {
-            assertEquals(15, target.getUpdating(i));
-        }
-    }
-
-    @Test
-    void testExtrudeLowerPreservesZeroFlag() {
-        // UNINIT source (storageUpdating == null) takes the setUninitialised() path
-        // Use an INIT source with zeroFlag set via setZero()
-        SWMRNibbleArray source = new SWMRNibbleArray();
-        source.setZero();
-        assertTrue(source.isZeroUpdating());
-        assertFalse(source.isFullUpdating());
-
-        SWMRNibbleArray target = new SWMRNibbleArray();
-        target.extrudeLower(source);
-        assertTrue(target.isZeroUpdating(), "extrudeLower from zero source should preserve zeroFlag");
-        assertFalse(target.isFullUpdating());
-        for (int i = 0; i < 4096; i++) {
-            assertEquals(0, target.getUpdating(i));
+            assertEquals(expected, target.getUpdating(i));
         }
     }
 
@@ -188,7 +172,7 @@ class SWMRNibbleArrayTest {
     void testExtrudeLowerNonUniformClearsFlags() {
         SWMRNibbleArray source = new SWMRNibbleArray();
         source.setFull();
-        source.set(0, 0, 0, 5); // breaks uniformity, clears fullFlag
+        source.set(0, 0, 0, 5);
         assertFalse(source.isFullUpdating());
         assertFalse(source.isZeroUpdating());
 
@@ -196,5 +180,41 @@ class SWMRNibbleArrayTest {
         target.extrudeLower(source);
         assertFalse(target.isFullUpdating(), "extrudeLower from non-uniform source should not set fullFlag");
         assertFalse(target.isZeroUpdating());
+    }
+
+    @Test
+    void testSnapshotVisibleReportsStatesAndCopies() {
+        final byte[] dst = new byte[SWMRNibbleArray.ARRAY_SIZE];
+        assertEquals(SWMRNibbleArray.VISIBLE_ZERO, NibbleStates.uninit().snapshotVisible(dst, 0), "UNINIT carries no array and reads 0");
+        assertEquals(SWMRNibbleArray.VISIBLE_ABSENT, NibbleStates.nullNibble().snapshotVisible(dst, 0));
+        assertEquals(SWMRNibbleArray.VISIBLE_ZERO, NibbleStates.zeroInit().snapshotVisible(dst, 0));
+        assertEquals(SWMRNibbleArray.VISIBLE_FULL, NibbleStates.full().snapshotVisible(dst, 0));
+
+        SWMRNibbleArray lit = NibbleStates.lit(0, 0, 0, 7);
+        assertEquals(SWMRNibbleArray.VISIBLE_DATA, lit.snapshotVisible(dst, 0));
+        assertArrayEquals(lit.getVisibleData(), dst);
+
+        lit.set(1, 0, 0, 9);
+        lit.updateVisible();
+        assertEquals(0x07, dst[0] & 0xFF, "the snapshot is a copy, not the live visible array");
+    }
+
+    @Test
+    void testEqualWriteOnHiddenIsANoOp() {
+        SWMRNibbleArray arr = new SWMRNibbleArray();
+        arr.set(3, 5, 7, 9);
+        arr.setHidden();
+        arr.updateVisible();
+
+        final int index = 3 | (7 << 4) | (5 << 8);
+        assertFalse(arr.setChanged(index, 9), "a HIDDEN nibble already holds data, so an equal write must not dirty it");
+        assertFalse(arr.isDirty());
+    }
+
+    @Test
+    void testUninitEqualZeroWriteStillPromotes() {
+        SWMRNibbleArray arr = new SWMRNibbleArray();
+        assertTrue(arr.setChanged(0, 0), "the write is what promotes UNINIT, so an equal value still counts as changed");
+        assertTrue(arr.isInitialisedUpdating());
     }
 }

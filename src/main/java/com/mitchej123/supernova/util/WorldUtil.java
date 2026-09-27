@@ -6,7 +6,7 @@ package com.mitchej123.supernova.util;
  */
 public final class WorldUtil {
 
-    // Inclusive section bounds for block data -- replace with cubic chunks values at init time.
+    // Inclusive bounds over block-data sections.
     private static int minSection = 0;
     private static int maxSection = 15;
 

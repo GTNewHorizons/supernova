@@ -1,9 +1,12 @@
 package com.mitchej123.supernova.light.engine;
 
 import com.mitchej123.supernova.api.ColoredLightSource;
+import com.mitchej123.supernova.api.ExtendedSection;
 import com.mitchej123.supernova.api.LightColorRegistry;
 import com.mitchej123.supernova.api.PackedColorLight;
 import com.mitchej123.supernova.api.TranslucencyRegistry;
+import com.mitchej123.supernova.light.ChunkLightHelper;
+import com.mitchej123.supernova.light.DynamicEmissionSnapshots;
 import com.mitchej123.supernova.light.LightStats;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.light.SupernovaChunk;
@@ -21,10 +24,24 @@ import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 public class SupernovaBlockEngine extends SupernovaRGBEngine {
 
     private final IBlockAccess safeBlockAccess;
+    private final DynamicEmissionSnapshots dynamicEmission;
 
     public SupernovaBlockEngine(final World world, final SnapshotChunkMap chunkMap) {
+        this(world, chunkMap, null);
+    }
+
+    public SupernovaBlockEngine(final World world, final SnapshotChunkMap chunkMap, final DynamicEmissionSnapshots dynamicEmission) {
         super(false, world);
         this.safeBlockAccess = new SafeBlockAccess(chunkMap);
+        this.dynamicEmission = dynamicEmission;
+    }
+
+    private int emissionAt(final Block block, final int blockId, final int meta, final int x, final int y, final int z) {
+        if (this.dynamicEmission != null && LightColorRegistry.isPositional(blockId)) {
+            final Integer sampled = this.dynamicEmission.get(x, y, z);
+            if (sampled != null) return sampled;
+        }
+        return LightColorRegistry.getPackedEmission(this.safeBlockAccess, block, meta, x, y, z);
     }
 
     @Override
@@ -49,12 +66,12 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
 
     @Override
     protected boolean canUseChunk(final Chunk chunk) {
-        return ((SupernovaChunk) chunk).isLightReady();
+        return ((SupernovaChunk) chunk).isLightUsable();
     }
 
     @Override
     protected void setNibbleNull(final int chunkX, final int chunkY, final int chunkZ) {
-        // Block light uses setHidden() instead of setNull() -- maintains data for decrease propagation
+        // setHidden(), not setNull(): the data still feeds decrease propagation.
         final int idx = chunkX + 5 * chunkZ + (5 * 5) * chunkY + this.chunkSectionIndexOffset;
         final SWMRNibbleArray nibR = this.nibbleCacheR[idx];
         if (nibR != null) nibR.setHidden();
@@ -62,7 +79,6 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
         if (nibG != null) nibG.setHidden();
         final SWMRNibbleArray nibB = this.nibbleCacheB[idx];
         if (nibB != null) nibB.setHidden();
-        // Don't release packed cache for HIDDEN -- data is still valid for decrease propagation
     }
 
     @Override
@@ -75,7 +91,6 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
         initSingleNibble(this.nibbleCacheR, idx, initRemovedNibbles);
         initSingleNibble(this.nibbleCacheG, idx, initRemovedNibbles);
         initSingleNibble(this.nibbleCacheB, idx, initRemovedNibbles);
-        // Invalidate packed cache -- nibble data changed
         releasePackedArray(this.packedRGBCache[idx]);
         this.packedRGBCache[idx] = null;
         this.packedCacheDirty[idx] = false;
@@ -118,19 +133,9 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
     protected void syncToVanilla(final ExtendedBlockStorage section, final SWMRNibbleArray nibR, final SWMRNibbleArray nibG, final SWMRNibbleArray nibB, final int minByte, final int maxByte) {
         final NibbleArray vanilla = section.getBlocklightArray();
         if (vanilla == null) return;
-        final byte[] rData = nibR != null ? nibR.getVisibleData() : null;
-        final byte[] gData = nibG != null ? nibG.getVisibleData() : null;
-        final byte[] bData = nibB != null ? nibB.getVisibleData() : null;
-        for (int i = minByte; i <= maxByte; ++i) {
-            final int rByte = rData != null ? rData[i] & 0xFF : 0;
-            final int gByte = gData != null ? gData[i] & 0xFF : 0;
-            final int bByte = bData != null ? bData[i] & 0xFF : 0;
-            final int rLo = rByte & 0xF, rHi = (rByte >>> 4) & 0xF;
-            final int gLo = gByte & 0xF, gHi = (gByte >>> 4) & 0xF;
-            final int bLo = bByte & 0xF, bHi = (bByte >>> 4) & 0xF;
-            final int maxLo = Math.max(rLo, Math.max(gLo, bLo));
-            final int maxHi = Math.max(rHi, Math.max(gHi, bHi));
-            vanilla.data[i] = (byte) (maxLo | (maxHi << 4));
+        synchronized (section) {
+            final boolean nonTrivial = ChunkLightHelper.maxIntoVanilla(vanilla, ChunkLightHelper.visibleData(nibR), ChunkLightHelper.visibleData(nibG), ChunkLightHelper.visibleData(nibB), minByte, maxByte, 0);
+            ((ExtendedSection) section).supernova$updateLightNonTrivial(false, nonTrivial, vanilla.data, 0);
         }
     }
 
@@ -140,18 +145,16 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
         final int currentRGB = this.getLightLevel(worldX, worldY, worldZ);
 
         final Block block = this.getBlock(worldX, worldY, worldZ);
+        final long sf = sidedFlag(this.lastBlockId);
         final int meta = this.getBlockMeta(worldX, worldY, worldZ);
-        final int emittedRGB = LightColorRegistry.getPackedEmission(this.safeBlockAccess, block, meta, worldX, worldY, worldZ);
+        final int emittedRGB = emissionAt(block, this.lastBlockId, meta, worldX, worldY, worldZ);
 
         final int calculatedRGB = this.calculateLightValueWithBlock(worldX, worldY, worldZ, PackedColorLight.ALL_CHANNELS, block, meta);
-        // Early out: if current value already matches full expectation, nothing changed
         if (currentRGB == calculatedRGB) {
             return;
         }
 
         this.setLightLevel(worldX, worldY, worldZ, emittedRGB);
-
-        final long sf = sidedFlag(block);
 
         if (emittedRGB != 0) {
             this.appendToIncreaseQueue(encodeCoords(worldX, worldZ, worldY, encodeOffset)
@@ -174,7 +177,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
     }
 
     private int calculateLightValueWithBlock(final int worldX, final int worldY, final int worldZ, final int expect, final Block block, final int meta) {
-        int level = LightColorRegistry.getPackedEmission(this.safeBlockAccess, block, meta, worldX, worldY, worldZ);
+        int level = emissionAt(block, this.lastBlockId, meta, worldX, worldY, worldZ);
 
         if (PackedColorLight.maxComponent(level) >= 14 || PackedColorLight.anyComponentGreater(level, expect)) {
             return level;
@@ -224,7 +227,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
 
         for (int sectionY = this.minSection; sectionY <= this.maxSection; ++sectionY) {
             final ExtendedBlockStorage section = sections[sectionY - this.minSection];
-            if (section == null || section.isEmpty()) {
+            if (section == null || ((ExtendedSection) section).supernova$hasNoBlocks()) {
                 continue;
             }
 
@@ -240,17 +243,13 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                 final int worldY = offY | ly;
                 final int worldZ = offZ | lz;
 
-                final Block block = this.getBlockFast(sectionIdx, lx, ly, lz);
-                // Use non-positional getLightValue() -- during lightChunk we must not call
-                // World.getBlock() as it can trigger recursive chunk loading/generation.
-                if (block.getLightValue() <= 0 && !LightColorRegistry.hasExplicitEntry(block)) {
-                    continue;
-                }
-
+                // Cache lookup by id: no Block resolve for the non-emitting bulk. Never World.getBlock here, it can recurse into chunk generation.
+                final int blockId = this.getBlockIdFast(sectionIdx, lx, ly, lz);
+                if (blockId == 0) continue;
                 final int meta = section.getExtBlockMetadata(lx, ly, lz);
-
-                // Use world-safe variant to avoid recursive chunk loading during generation.
-                final int emittedRGB = LightColorRegistry.getPackedEmissionNoWorld(block, meta);
+                final int emittedRGB = LightColorRegistry.isPositional(blockId)
+                    ? emissionAt(Block.getBlockById(blockId), blockId, meta, worldX, worldY, worldZ)
+                    : LightColorRegistry.getPackedEmissionCached(blockId, meta);
                 if (emittedRGB == 0) {
                     continue;
                 }
@@ -265,7 +264,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                 this.appendToIncreaseQueue(encodeCoords(worldX, worldZ, worldY, this.coordinateOffset)
                         | PackedColorLightQueue.encodeQueuePackedRGB(newRGB)
                         | (((long) ALL_DIRECTIONS_BITSET) << RGB_DIR_SHIFT)
-                        | sidedFlag(block));
+                        | sidedFlag(blockId));
 
                 this.setLightLevel(worldX, worldY, worldZ, newRGB);
             }
@@ -300,37 +299,6 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
     }
 
     @Override
-    protected boolean areBothEdgeSectionsFull(final int currIdx, final int nIdx) {
-        return isEdgeSectionFull(currIdx) && isEdgeSectionFull(nIdx);
-    }
-
-    private boolean isEdgeSectionFull(final int idx) {
-        if (this.packedRGBCache[idx] != null) {
-            final int full = PackedColorLight.pack(15, 15, 15);
-            return this.packedAnd[idx] == full && this.packedOr[idx] == full;
-        }
-        final SWMRNibbleArray r = this.nibbleCacheR[idx];
-        final SWMRNibbleArray g = this.nibbleCacheG[idx];
-        final SWMRNibbleArray b = this.nibbleCacheB[idx];
-        return r != null && r.isFullUpdating() && g != null && g.isFullUpdating() && b != null && b.isFullUpdating();
-    }
-
-    @Override
-    protected boolean areBothEdgeSectionsZero(final int currIdx, final int nIdx) {
-        return isEdgeSectionZero(currIdx) && isEdgeSectionZero(nIdx);
-    }
-
-    private boolean isEdgeSectionZero(final int idx) {
-        if (this.packedRGBCache[idx] != null) {
-            return this.packedOr[idx] == 0;
-        }
-        final SWMRNibbleArray r = this.nibbleCacheR[idx];
-        final SWMRNibbleArray g = this.nibbleCacheG[idx];
-        final SWMRNibbleArray b = this.nibbleCacheB[idx];
-        return (r == null || r.isZeroUpdating()) && (g == null || g.isZeroUpdating()) && (b == null || b.isZeroUpdating());
-    }
-
-    @Override
     protected void checkChunkEdge(final int chunkX, final int chunkY, final int chunkZ) {
         final int currIdx = chunkX + 5 * chunkZ + (5 * 5) * chunkY + this.chunkSectionIndexOffset;
         final SWMRNibbleArray currNibble = this.nibbleCache[currIdx];
@@ -344,7 +312,6 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
             final int nIdx = (chunkX + neighbourOffX) + 5 * (chunkZ + neighbourOffZ) + (5 * 5) * chunkY + this.chunkSectionIndexOffset;
             final SWMRNibbleArray neighbourNibble = this.nibbleCache[nIdx];
             if (neighbourNibble == null) continue;
-            if (!currNibble.isInitialisedUpdating() && !neighbourNibble.isInitialisedUpdating()) continue;
             if (this.areBothEdgeSectionsFull(currIdx, nIdx)) {
                 if (s != null) s.edgeSectionPairsSkippedFull.incrementAndGet();
                 continue;
@@ -356,7 +323,6 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
 
             if (s != null) s.edgeSectionPairsChecked.incrementAndGet();
 
-            // Ensure both sections have packed caches for fast inner loop access
             if (this.packedRGBCache[currIdx] == null) this.packSectionToCache(currIdx);
             if (this.packedRGBCache[nIdx] == null) this.packSectionToCache(nIdx);
             final int[] cPacked = this.packedRGBCache[currIdx];
@@ -402,7 +368,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                         continue;
                     }
 
-                    // RGB-aware consistency: if attenuated neighbor can't exceed current on any channel (and vice versa), this edge block is provably consistent
+                    // Neither attenuated side can exceed the other on any channel, so the edge is provably consistent.
                     final int attN = PackedColorLight.packedSubRGB(neighbourLevel, MIN_ABSORPTION);
                     final int attC = PackedColorLight.packedSubRGB(currentLevel, MIN_ABSORPTION);
                     if (!PackedColorLight.anyComponentGreater(attN, currentLevel) && !PackedColorLight.anyComponentGreater(attC, neighbourLevel)) {
@@ -469,21 +435,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
             final int propagatedRGB = PackedColorLightQueue.decodeQueueRGB(queueValue);
             final AxisDirection[] checkDirections = OLD_CHECK_DIRECTIONS[(int) ((queueValue >>> RGB_DIR_SHIFT) & 63L)];
 
-            final boolean hasSidedTransparent = (queueValue & FLAG_HAS_SIDED_TRANSPARENT_BLOCKS) != 0L;
-            Block srcBlock = null;
-            int srcMeta = 0;
-            boolean checkSourceFaces = false;
-            if (hasSidedTransparent) {
-                final int srcIdx = (posX >> 4) + 5 * (posZ >> 4) + (5 * 5) * (posY >> 4) + sectionOffset;
-                srcBlock = this.getBlockFast(srcIdx, posX & 15, posY & 15, posZ & 15);
-                if (srcBlock != Blocks.air && FaceOcclusion.hasSidedTransparency(srcBlock)) {
-                    final ExtendedBlockStorage srcSection = this.sectionCache[srcIdx];
-                    if (srcSection != null) {
-                        srcMeta = srcSection.getExtBlockMetadata(posX & 15, posY & 15, posZ & 15);
-                    }
-                    checkSourceFaces = true;
-                }
-            }
+            final boolean checkSourceFaces = this.resolveSourceFaces(queueValue, posX, posY, posZ, sectionOffset);
 
             if ((queueValue & FLAG_RECHECK_LEVEL) != 0L) {
                 if (this.getLightLevel(posX, posY, posZ) != propagatedRGB) {
@@ -494,7 +446,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
             }
 
             for (final AxisDirection propagate : checkDirections) {
-                if (checkSourceFaces && FaceOcclusion.isFaceSolid(srcBlock, srcMeta, propagate.ordinal())) continue;
+                if (checkSourceFaces && this.isSourceFaceSolid(propagate.ordinal())) continue;
 
                 final int offX = posX + propagate.x;
                 final int offY = posY + propagate.y;
@@ -503,7 +455,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                 final int sectionIndex = (offX >> 4) + 5 * (offZ >> 4) + (5 * 5) * (offY >> 4) + sectionOffset;
                 final int localIndex = (offX & 15) | ((offZ & 15) << 4) | ((offY & 15) << 8);
 
-                // Check R nibble exists (all 3 are init'd/null'd together)
+                // R, G and B nibbles are init'd and null'd together, so R alone answers.
                 if (this.nibbleCacheR[sectionIndex] == null) {
                     continue;
                 }
@@ -511,13 +463,14 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                 final int currentRGB = this.getLightLevel(sectionIndex, localIndex);
 
                 final Block destBlock = this.getBlockFast(sectionIndex, offX & 15, offY & 15, offZ & 15);
+                final int destId = this.lastBlockId;
                 final int absorption;
                 if (destBlock == Blocks.air) {
                     absorption = MIN_ABSORPTION;
                 } else {
                     final ExtendedBlockStorage section = this.sectionCache[sectionIndex];
                     final int destMeta = section != null ? section.getExtBlockMetadata(offX & 15, offY & 15, offZ & 15) : 0;
-                    absorption = FaceOcclusion.resolveAbsorption(this.safeBlockAccess, destBlock, destMeta, propagate.oppositeOrdinal, offX, offY, offZ);
+                    absorption = FaceOcclusion.resolveAbsorption(this.safeBlockAccess, destId, destBlock, destMeta, propagate.oppositeOrdinal, offX, offY, offZ);
                 }
 
                 final int targetRGB = PackedColorLight.packedSubRGB(propagatedRGB, absorption);
@@ -526,8 +479,9 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                 }
 
                 final int newRGB = PackedColorLight.packedMax(targetRGB, currentRGB);
-                this.setLightLevelInCache(sectionIndex, localIndex, newRGB);
-                this.postLightUpdate(sectionIndex);
+                if (this.setLightLevelInCache(sectionIndex, localIndex, newRGB)) {
+                    this.postLightUpdate(sectionIndex, localIndex);
+                }
 
                 if (PackedColorLight.maxComponent(newRGB) > 1) {
                     if (queueLength >= queue.length) {
@@ -540,7 +494,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                     queue[queueLength++] = encodeCoords(offX, offZ, offY, encodeOffset)
                             | PackedColorLightQueue.encodeQueuePackedRGB(newRGB)
                             | (propagate.everythingButTheOppositeDirection << RGB_DIR_SHIFT)
-                            | sidedFlag(destBlock);
+                            | sidedFlag(destId);
                 }
             }
         }
@@ -570,24 +524,10 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
             final int propagatedRGB = PackedColorLightQueue.decodeQueueRGB(queueValue);
             final AxisDirection[] checkDirections = OLD_CHECK_DIRECTIONS[(int) ((queueValue >>> RGB_DIR_SHIFT) & 63)];
 
-            final boolean hasSidedTransparent = (queueValue & FLAG_HAS_SIDED_TRANSPARENT_BLOCKS) != 0L;
-            Block srcBlock = null;
-            int srcMeta = 0;
-            boolean checkSourceFaces = false;
-            if (hasSidedTransparent) {
-                final int srcIdx = (posX >> 4) + 5 * (posZ >> 4) + (5 * 5) * (posY >> 4) + sectionOffset;
-                srcBlock = this.getBlockFast(srcIdx, posX & 15, posY & 15, posZ & 15);
-                if (srcBlock != Blocks.air && FaceOcclusion.hasSidedTransparency(srcBlock)) {
-                    final ExtendedBlockStorage srcSection = this.sectionCache[srcIdx];
-                    if (srcSection != null) {
-                        srcMeta = srcSection.getExtBlockMetadata(posX & 15, posY & 15, posZ & 15);
-                    }
-                    checkSourceFaces = true;
-                }
-            }
+            final boolean checkSourceFaces = this.resolveSourceFaces(queueValue, posX, posY, posZ, sectionOffset);
 
             for (final AxisDirection propagate : checkDirections) {
-                if (checkSourceFaces && FaceOcclusion.isFaceSolid(srcBlock, srcMeta, propagate.ordinal())) continue;
+                if (checkSourceFaces && this.isSourceFaceSolid(propagate.ordinal())) continue;
 
                 final int offX = posX + propagate.x;
                 final int offY = posY + propagate.y;
@@ -606,6 +546,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                 }
 
                 final Block block = this.getBlockFast(sectionIndex, offX & 15, offY & 15, offZ & 15);
+                final int destId = this.lastBlockId;
                 final int absorption;
                 int destMeta = 0;
                 if (block == Blocks.air) {
@@ -613,17 +554,16 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                 } else {
                     final ExtendedBlockStorage section = this.sectionCache[sectionIndex];
                     destMeta = section != null ? section.getExtBlockMetadata(offX & 15, offY & 15, offZ & 15) : 0;
-                    absorption = FaceOcclusion.resolveAbsorption(this.safeBlockAccess, block, destMeta, propagate.oppositeOrdinal, offX, offY, offZ);
+                    absorption = FaceOcclusion.resolveAbsorption(this.safeBlockAccess, destId, block, destMeta, propagate.oppositeOrdinal, offX, offY, offZ);
                 }
 
                 final int targetRGB = PackedColorLight.packedSubRGB(propagatedRGB, absorption);
-                final long sFlag = sidedFlag(block);
+                final long sFlag = sidedFlag(destId);
 
-                // Per-channel: channels where current > target have another source
                 final int keptMask = PackedColorLightQueue.channelMaskWhereGt(currentRGB, targetRGB);
 
                 if (keptMask == PackedColorLight.ALL_CHANNELS) {
-                    // All channels have another source -- re-propagate with RECHECK
+                    // Every channel has another source: re-propagate with RECHECK.
                     if (increaseQueueLength >= increaseQueue.length) {
                         if (increaseQueue.length >= MAX_QUEUE_SIZE) {
                             this.queueOverflowed = true;
@@ -639,23 +579,23 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                     continue;
                 }
 
-                // At least some channels need clearing
                 final int keptRGB = currentRGB & keptMask;
 
-                // Clear to kept-only during decrease; emission deferred to increase phase
-                this.setLightLevelInCache(sectionIndex, localIndex, keptRGB);
-                this.postLightUpdate(sectionIndex);
+                // Decrease clears down to the kept channels; emission is re-applied in the increase phase.
+                if (this.setLightLevelInCache(sectionIndex, localIndex, keptRGB)) {
+                    this.postLightUpdate(sectionIndex, localIndex);
+                }
 
-                // Fast path: field read avoids World.getBlock() for non-emitting blocks
+                // Field read avoids World.getBlock() for the non-emitting bulk.
                 final int emittedRGB;
-                if (block.getLightValue() <= 0 && !(block instanceof ColoredLightSource) && !LightColorRegistry.hasExplicitEntry(block)) {
+                if (block.getLightValue() <= 0 && !(block instanceof ColoredLightSource)
+                    && !LightColorRegistry.hasExplicitEntry(destId) && !LightColorRegistry.isPositional(destId)) {
                     emittedRGB = 0;
                 } else {
-                    emittedRGB = LightColorRegistry.getPackedEmission(this.safeBlockAccess, block, destMeta, offX, offY, offZ);
+                    emittedRGB = emissionAt(block, destId, destMeta, offX, offY, offZ);
                 }
                 final int newRGB = PackedColorLight.packedMax(keptRGB, emittedRGB);
 
-                // Re-increase from remaining light (kept + emission)
                 if (newRGB != 0) {
                     final long flags = (newRGB != keptRGB) ? FLAG_WRITE_LEVEL : FLAG_RECHECK_LEVEL;
                     if (increaseQueueLength >= increaseQueue.length) {
@@ -670,8 +610,7 @@ public class SupernovaBlockEngine extends SupernovaRGBEngine {
                                     << RGB_DIR_SHIFT) | flags | sFlag;
                 }
 
-                // Continue decrease only for cleared channels that actually had light. Masking by channelPresenceMask prevents re-propagating channels already
-                // zeroed by a prior BFS visit from a different direction.
+                // channelPresenceMask stops re-propagating channels a prior visit from another direction already zeroed.
                 final int clearedMask = ~keptMask & PackedColorLight.ALL_CHANNELS;
                 final int decreaseRGB = targetRGB & clearedMask & PackedColorLight.channelPresenceMask(currentRGB);
                 if (PackedColorLight.anyNonZero(decreaseRGB)) {

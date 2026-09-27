@@ -8,18 +8,22 @@ import com.mitchej123.supernova.light.engine.ScalarSkyEngine;
 import com.mitchej123.supernova.light.engine.SupernovaBlockEngine;
 import com.mitchej123.supernova.light.engine.SupernovaEngine;
 import com.mitchej123.supernova.light.engine.SupernovaSkyEngine;
+import com.gtnewhorizon.gtnhlib.util.ServerThreadUtil;
 import com.mitchej123.supernova.util.CoordinateUtils;
 import com.mitchej123.supernova.util.SnapshotChunkMap;
-import com.mitchej123.supernova.util.WorldUtil;
-import it.unimi.dsi.fastutil.longs.Long2ObjectOpenHashMap;
+import net.minecraft.entity.player.EntityPlayerMP;
+import net.minecraft.network.play.server.S21PacketChunkData;
 import net.minecraft.world.World;
+import net.minecraft.world.WorldServer;
 import net.minecraft.world.chunk.Chunk;
+import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 
 import java.util.concurrent.ConcurrentLinkedDeque;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.BiConsumer;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
+import java.util.function.LongSupplier;
 
 /**
  * Per-World light manager managing Supernova's light engine pools.
@@ -36,105 +40,109 @@ public final class WorldLightManager {
     private final Supplier<SupernovaEngine> blockEngineFactory;
 
     private final SnapshotChunkMap loadedChunkMap = new SnapshotChunkMap();
+    private final DynamicEmissionSnapshots dynamicEmission;
 
-    // Tracks in-flight light work per chunk -- used by awaitPendingWork to ensure chunk save reads post-BFS data on unload.
-    // Stores the shared completion future so we wait for both engines.
-    private final Long2ObjectOpenHashMap<SettableFuture<Void>> pendingWork = new Long2ObjectOpenHashMap<>();
-
-    // Separate worker threads + queues for sky and block light
     private final LightQueue skyQueue;
     private final LightQueue blockQueue;
     private final Thread skyWorkerThread;
     private final Thread blockWorkerThread;
     private volatile boolean running = true;
 
-    // Per-tick stats instrumentation
     private final LightStats stats;
 
-    // Client-only: render update coordinates queued by worker threads for main-thread drain.
-    // Each long packs (cx << 32) | ((cz & 0xFFFF) << 16) | (cy & 0xFFFF).
-    private final RenderUpdateQueue pendingRenderUpdates = new RenderUpdateQueue(4096);
+    private final InitialLightCoordinator initialLighting;
 
-    // Coordination for initial chunk lighting: both engines must finish before setLightReady(true).
-    // Maps chunk coordinate -> countdown + shared future. Accessed from both worker threads.
-    private final Long2ObjectOpenHashMap<ChunkLightCompletion> initialLightCompletions = new Long2ObjectOpenHashMap<>();
+    private final Lane skyLane;
+    private final Lane blockLane;
 
     private static final int MAX_RELIGHT_ATTEMPTS = 2;
-    private static final long EDGE_CHECK_BUDGET_NS = 10_000_000L; // 10ms wall-clock budget for edge check phase
-    private static final long BLOCK_CHANGE_BUDGET_NS = 5_000_000L; // 5ms budget for phase-1 block change drain
+    private static final long SLOW_TASK_NS = 100_000_000L;
+    private static final long UNLOAD_WAIT_NS = 10_000_000L;
+    private static final long SERVER_BATCH_BUDGET_NS = 10_000_000L;
+    private static final long CLIENT_TICK_BUDGET_NS = 2_000_000L;
+    private boolean clientStartsWithSky = true;
 
     public WorldLightManager(final World world, final boolean hasSkyLight, final boolean hasBlockLight) {
         this.world = world;
         this.hasSkyLight = hasSkyLight;
         this.hasBlockLight = hasBlockLight;
+        this.dynamicEmission = new DynamicEmissionSnapshots(world);
+        this.dynamicEmission.setManager(this);
         this.cachedSkyPropagators = hasSkyLight ? new ConcurrentLinkedDeque<>() : null;
         this.cachedBlockPropagators = hasBlockLight ? new ConcurrentLinkedDeque<>() : null;
 
-        this.skyEngineFactory = hasSkyLight ? (SupernovaConfig.isScalarMode() ? () -> new ScalarSkyEngine(world, this.loadedChunkMap) : () -> new SupernovaSkyEngine(world)) : null;
-        this.blockEngineFactory = hasBlockLight ? (SupernovaConfig.isScalarMode() ? () -> new ScalarBlockEngine(world, this.loadedChunkMap) : () -> new SupernovaBlockEngine(world, this.loadedChunkMap)) : null;
+        this.skyEngineFactory = hasSkyLight ? (SupernovaConfig.isScalarMode() ? () -> new ScalarSkyEngine(world) : () -> new SupernovaSkyEngine(world, this.loadedChunkMap)) : null;
+        this.blockEngineFactory = hasBlockLight ? (SupernovaConfig.isScalarMode() ? () -> new ScalarBlockEngine(world, this.dynamicEmission) : () -> new SupernovaBlockEngine(world, this.loadedChunkMap, this.dynamicEmission)) : null;
 
         this.skyQueue = hasSkyLight ? new LightQueue() : null;
         this.blockQueue = hasBlockLight ? new LightQueue() : null;
         this.stats = new LightStats(world.isRemote);
         if (this.skyQueue != null) this.skyQueue.setStats(this.stats);
         if (this.blockQueue != null) this.blockQueue.setStats(this.stats);
+        this.initialLighting = new InitialLightCoordinator(this.skyQueue, this.blockQueue, new ChunkLightPublisher(), this.loadedChunkMap::get);
 
-        if (this.cachedSkyPropagators != null) {
-            this.cachedSkyPropagators.addFirst(this.skyEngineFactory.get());
-            this.cachedSkyPropagators.addFirst(this.skyEngineFactory.get());
-        }
-        if (this.cachedBlockPropagators != null) {
-            this.cachedBlockPropagators.addFirst(this.blockEngineFactory.get());
-            this.cachedBlockPropagators.addFirst(this.blockEngineFactory.get());
-        }
+        this.skyLane = hasSkyLight ? new Lane("Sky", InitialLightCoordinator.SKY, this.skyQueue, this.cachedSkyPropagators, this.skyEngineFactory,
+            this.stats.skyChangeBudgetYields, this.stats.skyWorkerTimeNs, this.stats.skyTasksProcessed) : null;
+        this.blockLane = hasBlockLight ? new Lane("Block", InitialLightCoordinator.BLOCK, this.blockQueue, this.cachedBlockPropagators, this.blockEngineFactory,
+            this.stats.blockChangeBudgetYields, this.stats.blockWorkerTimeNs, this.stats.blockTasksProcessed) : null;
 
-        if (hasSkyLight) {
-            this.skyWorkerThread = new Thread(
-                    () -> {
-                        while (this.running) {
-                            if (this.skyQueue.isEmpty()) {
-                                try {
-                                    this.skyQueue.waitForWork();
-                                } catch (final InterruptedException e) {
-                                    break;
-                                }
-                            }
-                            this.propagateSkyChanges();
-                        }
-                    }, "Supernova-Sky");
-            this.skyWorkerThread.setDaemon(true);
-            this.skyWorkerThread.start();
-        } else {
-            this.skyWorkerThread = null;
-        }
+        if (this.cachedSkyPropagators != null) this.cachedSkyPropagators.addFirst(this.skyEngineFactory.get());
+        if (this.cachedBlockPropagators != null) this.cachedBlockPropagators.addFirst(this.blockEngineFactory.get());
 
-        if (hasBlockLight) {
-            this.blockWorkerThread = new Thread(
-                    () -> {
-                        while (this.running) {
-                            if (this.blockQueue.isEmpty()) {
-                                try {
-                                    this.blockQueue.waitForWork();
-                                } catch (final InterruptedException e) {
-                                    break;
-                                }
-                            }
-                            this.propagateBlockChanges();
-                        }
-                    }, "Supernova-Block");
-            this.blockWorkerThread.setDaemon(true);
-            this.blockWorkerThread.start();
-        } else {
-            this.blockWorkerThread = null;
+        // Client drains both lanes on the main thread before the frame renders; a worker there would race the render and the sync path.
+        final boolean useWorkers = !world.isRemote;
+        this.skyWorkerThread = hasSkyLight && useWorkers ? startWorker(this.skyLane, "Supernova-Sky") : null;
+        this.blockWorkerThread = hasBlockLight && useWorkers ? startWorker(this.blockLane, "Supernova-Block") : null;
+    }
+
+    private Thread startWorker(final Lane lane, final String name) {
+        final Thread thread = new Thread(() -> runLane(lane), name);
+        thread.setDaemon(true);
+        thread.start();
+        return thread;
+    }
+
+    private void runLane(final Lane lane) {
+        while (this.running) {
+            try {
+                if (lane.queue.isEmpty()) lane.queue.waitForWork();
+                this.propagate(lane);
+            } catch (final InterruptedException e) {
+                Supernova.LOG.info("{} light worker interrupted -- exiting", lane.name);
+                Thread.currentThread().interrupt();
+                break;
+            } catch (final Throwable t) {
+                Supernova.LOG.error("{} light worker survived an uncaught throwable", lane.name, t);
+            }
         }
     }
 
     public void registerChunk(final Chunk chunk) {
+        this.dynamicEmission.registerChunk(chunk);
         this.loadedChunkMap.put(CoordinateUtils.getChunkKey(chunk.xPosition, chunk.zPosition), chunk);
     }
 
     public void unregisterChunk(final int cx, final int cz) {
         this.loadedChunkMap.remove(CoordinateUtils.getChunkKey(cx, cz));
+        this.dynamicEmission.unregisterChunk(cx, cz);
+    }
+
+    /** Seam light is final only once no loaded neighbor is mid-relight, and 1.7.10 cannot correct a chunk once sent. */
+    public boolean isReadyToSend(final int cx, final int cz) {
+        if (!isChunkLightReady(cx, cz)) return false;
+        return isNeighborSettled(cx - 1, cz) && isNeighborSettled(cx + 1, cz)
+            && isNeighborSettled(cx, cz - 1) && isNeighborSettled(cx, cz + 1);
+    }
+
+    private boolean isChunkLightReady(final int cx, final int cz) {
+        final Chunk chunk = this.loadedChunkMap.get(CoordinateUtils.getChunkKey(cx, cz));
+        return chunk != null && ((SupernovaChunk) chunk).isLightReady();
+    }
+
+    /** An unloaded neighbor never blocks: the outer view ring always has one, and a late arrival queues edge checks on both sides. */
+    private boolean isNeighborSettled(final int cx, final int cz) {
+        final Chunk chunk = this.loadedChunkMap.get(CoordinateUtils.getChunkKey(cx, cz));
+        return chunk == null || ((SupernovaChunk) chunk).isLightReady();
     }
 
     public Chunk getLoadedChunk(final int chunkX, final int chunkZ) {
@@ -150,395 +158,403 @@ public final class WorldLightManager {
 
     private static void releaseEngine(final ConcurrentLinkedDeque<SupernovaEngine> cache, final SupernovaEngine engine) {
         if (cache == null || engine == null) return;
-        engine.suppressRenderNotify = false;
-        engine.pendingRenderTarget = null;
-        if (cache.size() < 4) {
-            cache.addFirst(engine);
-        }
-    }
-
-    private SupernovaEngine getSkyLightEngine() {
-        return getEngine(this.cachedSkyPropagators, this.skyEngineFactory);
-    }
-
-    private SupernovaEngine getBlockLightEngine() {
-        return getEngine(this.cachedBlockPropagators, this.blockEngineFactory);
-    }
-
-    private void releaseSkyLightEngine(final SupernovaEngine engine) {
-        releaseEngine(this.cachedSkyPropagators, engine);
-    }
-
-    private void releaseBlockLightEngine(final SupernovaEngine engine) {
-        releaseEngine(this.cachedBlockPropagators, engine);
+        cache.addFirst(engine);
     }
 
     public void queueBlockChange(final int x, final int y, final int z) {
+        this.dynamicEmission.refreshPosition(x, y, z);
         if (this.skyQueue != null) this.skyQueue.queueBlockChange(x, y, z);
         if (this.blockQueue != null) this.blockQueue.queueBlockChange(x, y, z);
     }
 
+    public void tileEntityChanged(final int x, final int y, final int z) {
+        this.dynamicEmission.tileEntityChanged(x, y, z);
+    }
+
+    public void refreshDynamicEmission() {
+        this.dynamicEmission.tick();
+    }
+
+    /** A section appeared or vanished: the emptiness map and any nibble that depends on it have to be recomputed. */
+    public void queueSectionChange(final int cx, final int sectionY, final int cz, final boolean empty) {
+        if (this.skyQueue != null) this.skyQueue.queueSectionChange(cx, sectionY, cz, empty);
+        if (this.blockQueue != null) this.blockQueue.queueSectionChange(cx, sectionY, cz, empty);
+    }
+
+    public void queueEdgeChecks(final int cx, final int cz) {
+        if (this.skyQueue != null) this.skyQueue.queueEdgeCheckAllSections(cx, cz);
+        if (this.blockQueue != null) this.blockQueue.queueEdgeCheckAllSections(cx, cz);
+    }
+
     public void queueChunkLight(final int cx, final int cz, final Chunk chunk, final Boolean[] emptySections) {
-        final int engineCount = (this.hasSkyLight ? 1 : 0) + (this.hasBlockLight ? 1 : 0);
-        final ChunkLightCompletion completion = new ChunkLightCompletion(engineCount, chunk);
-        final long key = CoordinateUtils.getChunkKey(cx, cz);
-
-        synchronized (this.initialLightCompletions) {
-            this.initialLightCompletions.put(key, completion);
-        }
-
-        if (this.skyQueue != null) this.skyQueue.queueChunkLight(cx, cz, chunk, emptySections);
-        if (this.blockQueue != null) this.blockQueue.queueChunkLight(cx, cz, chunk, emptySections);
+        this.initialLighting.queue(cx, cz, chunk, emptySections);
     }
 
     public void removeChunkFromQueues(final int cx, final int cz) {
-        if (this.skyQueue != null) this.skyQueue.removeChunk(cx, cz);
-        if (this.blockQueue != null) this.blockQueue.removeChunk(cx, cz);
-        final long key = CoordinateUtils.getChunkKey(cx, cz);
-        synchronized (this.initialLightCompletions) {
-            this.initialLightCompletions.remove(key);
-        }
+        this.initialLighting.removeChunk(cx, cz);
     }
 
     public boolean hasUpdates() {
         return (this.skyQueue != null && !this.skyQueue.isEmpty()) || (this.blockQueue != null && !this.blockQueue.isEmpty());
     }
 
+    /** Backs {@link com.mitchej123.supernova.api.ExtendedWorld#supernova$hasChunkPendingLight}. */
     public boolean hasChunkPendingLight(final int cx, final int cz) {
         return (this.skyQueue != null && this.skyQueue.hasPendingWork(cx, cz)) || (this.blockQueue != null && this.blockQueue.hasPendingWork(cx, cz));
     }
 
-    public void processClientRenderUpdates() {
-        final long startNs = System.nanoTime();
-        final int count = this.pendingRenderUpdates.drain(v -> {
-            final int bx = (int) (v >> 32) << 4;
-            final int bz = (short) ((v >> 16) & 0xFFFF) << 4;
-            final int by = (short) (v & 0xFFFF) << 4;
-            this.world.markBlockRangeForRenderUpdate(bx, by, bz, bx + 15, by + 15, bz + 15);
-        });
-        if (count > 0) {
-            this.stats.drainedSections += count;
-            this.stats.drainTimeNs += System.nanoTime() - startNs;
-        }
-        final int skySize = this.skyQueue != null ? this.skyQueue.size() : 0;
-        final int blockSize = this.blockQueue != null ? this.blockQueue.size() : 0;
-        this.stats.tick(skySize, blockSize);
+    /** A task may write light in its own chunk or any directly adjacent chunk. */
+    public boolean hasUnsettledLightValues(final int cx, final int cz) {
+        return pendingWorkFuture(cx, cz) != null;
     }
 
-    public void scheduleUpdate() {
-        final int skySize = this.skyQueue != null ? this.skyQueue.size() : 0;
-        final int blockSize = this.blockQueue != null ? this.blockQueue.size() : 0;
-        this.stats.tick(skySize, blockSize);
+    public void drainClientLight() {
+        drainClientLight(System::nanoTime);
     }
 
-    private void propagateSkyChanges() {
-        this.propagateChanges(this.skyQueue, this.cachedSkyPropagators, this.skyEngineFactory,
-                this::processSkyTask, this.stats.skyChangeBudgetYields, "propagateSkyChanges");
+    void drainClientLight(final LongSupplier nanoTime) {
+        if (!this.hasUpdates()) return;
+        final long deadline = nanoTime.getAsLong() + CLIENT_TICK_BUDGET_NS;
+        boolean skyFirst = this.clientStartsWithSky;
+        this.clientStartsWithSky = !skyFirst;
+        do {
+            final Lane first = skyFirst ? this.skyLane : this.blockLane;
+            final Lane second = skyFirst ? this.blockLane : this.skyLane;
+            final boolean processed = runClientTask(first) || runClientTask(second);
+            if (!processed) break;
+            skyFirst = !skyFirst;
+        } while (nanoTime.getAsLong() < deadline);
+        this.tick();
     }
 
-    private void propagateBlockChanges() {
-        this.propagateChanges(this.blockQueue, this.cachedBlockPropagators, this.blockEngineFactory,
-                this::processBlockTask, this.stats.blockChangeBudgetYields, "propagateBlockChanges");
-    }
-
-
-    private void propagateChanges(final LightQueue queue, final ConcurrentLinkedDeque<SupernovaEngine> cache, final Supplier<SupernovaEngine> factory, final BiConsumer<ChunkTasks, SupernovaEngine> taskProcessor, final AtomicInteger changeBudgetYield, final String label) {
-        final SupernovaEngine engine = getEngine(cache, factory);
-        if (engine == null) return;
-        if (this.world.isRemote) {
-            engine.suppressRenderNotify = true;
-            engine.pendingRenderTarget = this.pendingRenderUpdates;
-        }
+    private boolean runClientTask(final Lane lane) {
+        if (lane == null || lane.queue.isEmpty()) return false;
+        final SupernovaEngine engine = getEngine(lane.cache, lane.factory);
+        if (engine == null) return false;
         try {
-            // 1. Block changes (highest priority) -- budget-limited to avoid multi-second bursts
-            final long changeBudget = System.nanoTime() + BLOCK_CHANGE_BUDGET_NS;
+            return runNextTask(lane, engine) != null;
+        } finally {
+            releaseEngine(lane.cache, engine);
+        }
+    }
+
+    public void tick() {
+        if (!this.stats.enabled) return;
+        final int skySize = this.skyQueue != null ? this.skyQueue.size() : 0;
+        final int blockSize = this.blockQueue != null ? this.blockQueue.size() : 0;
+        this.stats.tick(skySize, blockSize);
+    }
+
+    private static final class Lane {
+
+        final String name;
+        final int mask;
+        final LightQueue queue;
+        final ConcurrentLinkedDeque<SupernovaEngine> cache;
+        final Supplier<SupernovaEngine> factory;
+        final AtomicInteger changeBudgetYields;
+        final AtomicLong workerTimeNs;
+        final AtomicLong tasksProcessed;
+
+        Lane(final String name, final int mask, final LightQueue queue, final ConcurrentLinkedDeque<SupernovaEngine> cache,
+            final Supplier<SupernovaEngine> factory, final AtomicInteger changeBudgetYields, final AtomicLong workerTimeNs, final AtomicLong tasksProcessed) {
+            this.name = name;
+            this.mask = mask;
+            this.queue = queue;
+            this.cache = cache;
+            this.factory = factory;
+            this.changeBudgetYields = changeBudgetYields;
+            this.workerTimeNs = workerTimeNs;
+            this.tasksProcessed = tasksProcessed;
+        }
+    }
+
+    private void propagate(final Lane lane) {
+        final SupernovaEngine engine = getEngine(lane.cache, lane.factory);
+        if (engine == null) return;
+        final long deadline = System.nanoTime() + SERVER_BATCH_BUDGET_NS;
+        try {
             ChunkTasks task;
-            while ((task = queue.removeFirstBlockChangeTask()) != null) {
-                taskProcessor.accept(task, engine);
-                if (System.nanoTime() > changeBudget) {
-                    changeBudgetYield.incrementAndGet();
+            while ((task = runNextTask(lane, engine)) != null) {
+                if (System.nanoTime() >= deadline) {
+                    if (this.stats.enabled) {
+                        if (task.hasBlockChanges()) lane.changeBudgetYields.incrementAndGet();
+                        else this.stats.edgeBudgetYields.incrementAndGet();
+                    }
                     break;
                 }
             }
-
-            // Loop phases 2+3 so initial lights can preempt edge checks
-            boolean moreWork = true;
-            while (moreWork) {
-                moreWork = false;
-                // 2. Initial light tasks
-                while ((task = queue.removeFirstInitialLightTask()) != null) {
-                    taskProcessor.accept(task, engine);
-                    // Interleave block changes
-                    ChunkTasks priorityTask;
-                    while ((priorityTask = queue.removeFirstBlockChangeTask()) != null) {
-                        taskProcessor.accept(priorityTask, engine);
-                    }
-                }
-                // 3. Edge checks -- preempt if initial light arrives, budget-limited
-                final long edgeDeadline = System.nanoTime() + EDGE_CHECK_BUDGET_NS;
-                while ((task = queue.removeFirstTask()) != null) {
-                    taskProcessor.accept(task, engine);
-                    ChunkTasks priorityTask;
-                    while ((priorityTask = queue.removeFirstBlockChangeTask()) != null) {
-                        taskProcessor.accept(priorityTask, engine);
-                    }
-                    if (queue.hasInitialLightTask()) {
-                        moreWork = true;
-                        break;
-                    }
-                    if (System.nanoTime() > edgeDeadline) {
-                        this.stats.edgeBudgetYields.incrementAndGet();
-                        break;
-                    }
-                }
-            }
         } catch (final Throwable t) {
-            Supernova.LOG.error("Exception in " + label, t);
+            Supernova.LOG.error("Throwable draining the {} light lane", lane.name, t);
         } finally {
-            releaseEngine(cache, engine);
+            releaseEngine(lane.cache, engine);
         }
     }
 
-    private void processSkyTask(final ChunkTasks task, final SupernovaEngine skyEngine) {
-        final long t0 = System.nanoTime();
-        final int cx = CoordinateUtils.getChunkX(task.chunkCoordinate);
-        final int cz = CoordinateUtils.getChunkZ(task.chunkCoordinate);
+    private ChunkTasks runNextTask(final Lane lane, final SupernovaEngine engine) {
+        ChunkTasks task = lane.queue.removeFirstBlockChangeTask();
+        if (task == null) task = lane.queue.removeFirstInitialLightTask();
+        if (task == null) task = lane.queue.removeFirstTask();
+        if (task != null) runTask(lane, task, engine);
+        return task;
+    }
 
-        if (this.loadedChunkMap.get(task.chunkCoordinate) == null) {
-            this.completeInitialLighting(task.chunkCoordinate);
-            return;
-        }
-
-        this.stats.chunksProcessed.incrementAndGet();
-        this.stats.recordQueueLatency(task.enqueueTimeNs);
-        skyEngine.setStats(this.stats);
-
+    private void runTask(final Lane lane, final ChunkTasks task, final SupernovaEngine engine) {
         try {
-            // 1. Initial chunk lighting (deferred edges -- neighbor-aware)
-            if (task.initialLightChunk != null) {
-                this.stats.initialLightsRun.incrementAndGet();
-                skyEngine.light(task.initialLightChunk, task.initialLightEmptySections, false);
-                this.completeInitialLighting(task.chunkCoordinate);
-
-                // Edge coalescing: only queue edge checks for the newly-lit chunk, not neighbors. Neighbors will get edge-checked when THEIR next neighbor
-                // arrives. Correctness: propagateNeighbourLevels() during lightChunk() already seeds neighbor light into the new chunk during initial BFS.
-                this.skyQueue.queueEdgeCheckAllSections(cx, cz, true);
-            }
-
-            // 2+3. Combined section + block changes
-            if (task.changedSectionSet != null || (task.changedPositions != null && !task.changedPositions.isEmpty())) {
-                skyEngine.blocksChangedInChunk(cx, cz, task.changedPositions, task.changedSectionSet);
-            }
-
-            // 4. Sky edge checks
-            if (task.queuedEdgeChecksSky != null) {
-                skyEngine.checkChunkEdges(cx, cz, task.queuedEdgeChecksSky);
-            }
-
-            // 5. Overflow requeue
-            if (skyEngine.wasQueueOverflowed()) {
-                if (task.relightAttempts < MAX_RELIGHT_ATTEMPTS) {
-                    final Chunk chunk = this.loadedChunkMap.get(task.chunkCoordinate);
-                    if (chunk != null) {
-                        this.skyQueue.requeueChunkLight(cx, cz, chunk, SupernovaEngine.getEmptySectionsForChunk(chunk), task.relightAttempts);
-                    }
-                } else {
-                    Supernova.LOG.error("Sky engine: chunk ({}, {}) overflowed BFS queue {} times -- giving up.", cx, cz, task.relightAttempts + 1);
-                }
-            }
-        } catch (final NullPointerException e) {
-            this.completeInitialLighting(task.chunkCoordinate);
-            if (this.loadedChunkMap.get(task.chunkCoordinate) != null) {
-                throw new RuntimeException("Unexpected NPE processing sky task for chunk (" + cx + ", " + cz + ")", e);
-            }
-            Supernova.LOG.warn("Sky task for chunk ({}, {}) aborted -- chunk unloaded during processing", cx, cz, e);
+            processTask(lane, task, engine);
+        } finally {
+            lane.queue.completeTask(task);
         }
-
-        skyEngine.setStats(null);
-        this.stats.skyWorkerTimeNs.addAndGet(System.nanoTime() - t0);
-        this.stats.skyTasksProcessed.incrementAndGet();
     }
 
-    private void processBlockTask(final ChunkTasks task, final SupernovaEngine blockEngine) {
+    private void processTask(final Lane lane, final ChunkTasks task, final SupernovaEngine engine) {
+        final boolean stats = this.stats.enabled;
         final long t0 = System.nanoTime();
         final int cx = CoordinateUtils.getChunkX(task.chunkCoordinate);
         final int cz = CoordinateUtils.getChunkZ(task.chunkCoordinate);
 
-        if (this.loadedChunkMap.get(task.chunkCoordinate) == null) {
-            this.completeInitialLighting(task.chunkCoordinate);
-            return;
-        }
-
-        this.stats.chunksProcessed.incrementAndGet();
-        this.stats.recordQueueLatency(task.enqueueTimeNs);
-        blockEngine.setStats(this.stats);
-
-        long changesNs = 0;
+        long changesNs = 0, edgesNs = 0;
         int changesPos = 0, changesBfsInc = 0, changesBfsDec = 0;
-        long edgesNs = 0;
         int edgeSec = 0, edgeBfsInc = 0, edgeBfsDec = 0;
 
+        boolean finishPropagation = task.initialLightChunk != null;
+        boolean finishEdges = task.edgePass && task.queuedEdgeChecks != null;
+
         try {
-            // 1. Initial chunk lighting -- use propagateNeighbourLevels (checkEdges=false) so existing
-            //    neighbor light seeds into the chunk during BFS. Edge checks are deferred to a subsequent
-            //    worker pass when more neighbors are likely available (mirrors the sky engine pattern).
-            if (task.initialLightChunk != null) {
-                blockEngine.light(task.initialLightChunk, task.initialLightEmptySections, false);
-
-                // Queue per-section render updates for sections with non-zero block light.
-                if (this.world.isRemote) {
-                    final SupernovaChunk ext = (SupernovaChunk) task.initialLightChunk;
-                    final SWMRNibbleArray[] rNibs = ext.getBlockNibblesR();
-                    if (rNibs != null) {
-                        for (int i = 0; i < rNibs.length; i++) {
-                            final SWMRNibbleArray r = rNibs[i];
-                            if (r == null || r.isNullNibbleUpdating() || r.isUninitialisedUpdating()) continue;
-                            final int sectionY = i + WorldUtil.getMinLightSection();
-                            this.pendingRenderUpdates.offer(((long) cx << 32) | ((long) (cz & 0xFFFF) << 16) | (sectionY & 0xFFFFL));
-                        }
-                    }
-                }
-
-                this.completeInitialLighting(task.chunkCoordinate);
-                // Enqueue deferred edge checks for all light sections
-                this.blockQueue.queueEdgeCheckAllSections(cx, cz, false);
+            final Chunk loaded = this.loadedChunkMap.get(task.chunkCoordinate);
+            if (loaded == null) return;
+            if (task.initialLightChunk != null && task.initialLightChunk != loaded) {
+                // Chunk object replaced while queued.
+                Supernova.LOG.debug("{} task for chunk ({}, {}) dropped -- chunk object replaced while queued", lane.name, cx, cz);
+                return;
             }
 
-            // 2+3. Combined section + block changes
+            if (stats) {
+                this.stats.chunksProcessed.incrementAndGet();
+                this.stats.recordQueueLatency(task.enqueueTimeNs);
+                engine.setStats(this.stats);
+            }
+
+            boolean valueOverflow = false;
+            // checkEdges=false: neighbor light still seeds via propagateNeighbourLevels; seams wait for their own pass.
+            if (task.initialLightChunk != null) {
+                // Exactly one lane counts, or a world with both would double-count.
+                if (stats && (lane.mask == InitialLightCoordinator.SKY || this.skyQueue == null)) this.stats.initialLightsRun.incrementAndGet();
+                engine.light(task.initialLightChunk, task.initialLightEmptySections, false);
+                valueOverflow = engine.wasQueueOverflowed();
+            }
+
             if (task.changedSectionSet != null || (task.changedPositions != null && !task.changedPositions.isEmpty())) {
                 final long t1 = System.nanoTime();
-                blockEngine.blocksChangedInChunk(cx, cz, task.changedPositions, task.changedSectionSet);
+                engine.blocksChangedInChunk(cx, cz, task.changedPositions, task.changedSectionSet);
                 changesNs = System.nanoTime() - t1;
-                changesPos = blockEngine.lastPositionsProcessed;
-                changesBfsInc = blockEngine.lastBfsIncreaseTotal;
-                changesBfsDec = blockEngine.lastBfsDecreaseTotal;
-                this.stats.blockPositionsProcessed.addAndGet(changesPos);
+                changesPos = engine.lastPositionsProcessed;
+                changesBfsInc = engine.lastBfsIncreaseTotal;
+                changesBfsDec = engine.lastBfsDecreaseTotal;
+                if (stats && lane.mask == InitialLightCoordinator.BLOCK) this.stats.blockPositionsProcessed.addAndGet(changesPos);
+                valueOverflow |= engine.wasQueueOverflowed();
             }
 
-            // 4. Block edge checks
-            if (task.queuedEdgeChecksBlock != null) {
-                blockEngine.lastBfsIncreaseTotal = 0;
-                blockEngine.lastBfsDecreaseTotal = 0;
-                edgeSec = task.queuedEdgeChecksBlock.size();
+            if (task.queuedEdgeChecks != null) {
+                engine.lastBfsIncreaseTotal = 0;
+                engine.lastBfsDecreaseTotal = 0;
+                edgeSec = task.queuedEdgeChecks.size();
                 final long t2 = System.nanoTime();
-                blockEngine.checkChunkEdges(cx, cz, task.queuedEdgeChecksBlock);
+                engine.checkChunkEdges(cx, cz, task.queuedEdgeChecks);
                 edgesNs = System.nanoTime() - t2;
-                edgeBfsInc = blockEngine.lastBfsIncreaseTotal;
-                edgeBfsDec = blockEngine.lastBfsDecreaseTotal;
-            }
-
-            // 5. Overflow requeue
-            if (blockEngine.wasQueueOverflowed()) {
-                if (task.relightAttempts < MAX_RELIGHT_ATTEMPTS) {
-                    final Chunk chunk = this.loadedChunkMap.get(task.chunkCoordinate);
-                    if (chunk != null) {
-                        this.blockQueue.requeueChunkLight(cx, cz, chunk, SupernovaEngine.getEmptySectionsForChunk(chunk), task.relightAttempts);
-                    }
-                } else {
-                    Supernova.LOG.error("Block engine: chunk ({}, {}) overflowed BFS queue {} times -- giving up.", cx, cz, task.relightAttempts + 1);
+                edgeBfsInc = engine.lastBfsIncreaseTotal;
+                edgeBfsDec = engine.lastBfsDecreaseTotal;
+                if (engine.wasQueueOverflowed() && requeueEdgesAfterFailure(lane, task, cx, cz)) {
+                    finishEdges = false;
                 }
             }
-        } catch (final NullPointerException e) {
-            this.completeInitialLighting(task.chunkCoordinate);
-            if (this.loadedChunkMap.get(task.chunkCoordinate) != null) {
-                throw new RuntimeException("Unexpected NPE processing block task for chunk (" + cx + ", " + cz + ")", e);
+
+            if (valueOverflow && requeueAfterFailure(lane, task, cx, cz)) {
+                finishPropagation = false;
             }
-            Supernova.LOG.warn("Block task for chunk ({}, {}) aborted -- chunk unloaded during processing", cx, cz, e);
+        } catch (final Throwable t) {
+            if (this.loadedChunkMap.get(task.chunkCoordinate) != null) {
+                Supernova.LOG.error("Error processing {} task for chunk ({}, {})", lane.name, cx, cz, t);
+            } else {
+                Supernova.LOG.warn("{} task for chunk ({}, {}) aborted -- chunk unloaded during processing", lane.name, cx, cz);
+            }
+            // Retry rather than complete, or the generation publishes half-lit.
+            if (finishPropagation && requeueAfterFailure(lane, task, cx, cz)) finishPropagation = false;
+            if (finishEdges && requeueEdgesAfterFailure(lane, task, cx, cz)) finishEdges = false;
+        } finally {
+            if (finishPropagation) this.initialLighting.completePropagation(task, lane.mask);
+            if (finishEdges) this.initialLighting.completeEdges(task, lane.mask);
         }
 
-        blockEngine.setStats(null);
         final long totalNs = System.nanoTime() - t0;
-        this.stats.blockWorkerTimeNs.addAndGet(totalNs);
-        this.stats.blockTasksProcessed.incrementAndGet();
+        if (stats) {
+            engine.setStats(null);
+            lane.workerTimeNs.addAndGet(totalNs);
+            lane.tasksProcessed.incrementAndGet();
+        }
 
-        // Slow task warning (>100ms)
-        if (totalNs > 100_000_000L) {
+        if (totalNs > SLOW_TASK_NS) {
             Supernova.LOG.warn(
-                    "Slow block task: chunk ({},{}) total={}ms changes={}ms ({}pos, bfsInc={} bfsDec={}) edges={}ms ({}sec, bfsInc={} bfsDec={})",
-                    cx, cz, totalNs / 1_000_000L, changesNs / 1_000_000L, changesPos, changesBfsInc, changesBfsDec, edgesNs / 1_000_000L,
+                    "Slow {} task: chunk ({},{}) total={}ms changes={}ms ({}pos, bfsInc={} bfsDec={}) edges={}ms ({}sec, bfsInc={} bfsDec={})",
+                    lane.name, cx, cz, totalNs / 1_000_000L, changesNs / 1_000_000L, changesPos, changesBfsInc, changesBfsDec, edgesNs / 1_000_000L,
                     edgeSec, edgeBfsInc, edgeBfsDec);
         }
     }
 
-    /**
-     * Called by each worker when it finishes initial lighting for a chunk. The last worker to finish sets lightReady=true and completes the pending work
-     * future.
-     */
-    private void completeInitialLighting(final long chunkCoordinate) {
-        final ChunkLightCompletion completion;
-        synchronized (this.initialLightCompletions) {
-            completion = this.initialLightCompletions.get(chunkCoordinate);
-        }
-        if (completion == null) return;
 
-        if (completion.remaining.decrementAndGet() <= 0) {
-            synchronized (this.initialLightCompletions) {
-                this.initialLightCompletions.remove(chunkCoordinate);
+    private final class ChunkLightPublisher implements InitialLightCoordinator.Publisher {
+
+        @Override
+        public void beginGeneration(final Chunk chunk) {
+            // Client: stays usable, or MixinWorld's gate drops block changes until publish.
+            final boolean keepUsable = WorldLightManager.this.world.isRemote && ((SupernovaChunk) chunk).isLightUsable();
+            ((SupernovaChunk) chunk).setLightReady(false);
+            ((SupernovaChunk) chunk).setLightUsable(keepUsable);
+        }
+
+        @Override
+        public void markUsable(final Chunk chunk) {
+            ((SupernovaChunk) chunk).setLightUsable(true);
+        }
+
+        @Override
+        public void syncToVanilla(final Chunk chunk) {
+            ((SupernovaChunk) chunk).syncLightToVanilla();
+        }
+
+        @Override
+        public void markReady(final Chunk chunk) {
+            ((SupernovaChunk) chunk).setLightReady(true);
+            if (WorldLightManager.this.world.isRemote) {
+                markChunkForRenderUpdate(chunk);
+                return;
             }
-            // Sync BFS results to vanilla nibbles so chunk packets carry fully-propagated values
-            ((SupernovaChunk) completion.chunk).syncLightToVanilla();
-            ((SupernovaChunk) completion.chunk).setLightReady(true);
-            completion.future.set(null);
+            // Without the dirty mark an otherwise-unmodified chunk never persists its lighting and relights every load.
+            SupernovaChunk.markLightDirty(chunk);
         }
     }
 
-    /**
-     * Synchronous block change -- runs BFS on the calling thread. Used for player-initiated block place/break on the client so lighting updates are visually
-     * instant.
-     */
-    public void blockChange(final int x, final int y, final int z) {
-        if (y < WorldUtil.getMinBlockY() || y > WorldUtil.getMaxBlockY()) return;
-        final SupernovaEngine skyEngine = this.getSkyLightEngine();
-        final SupernovaEngine blockEngine = this.getBlockLightEngine();
-        try {
-            if (skyEngine != null) {
-                skyEngine.blockChanged(x, y, z);
-                if (skyEngine.wasQueueOverflowed()) requeueChunkFromSync(x >> 4, z >> 4);
-            }
-            if (blockEngine != null) {
-                blockEngine.blockChanged(x, y, z);
-                if (blockEngine.wasQueueOverflowed()) requeueChunkFromSync(x >> 4, z >> 4);
-            }
-        } finally {
-            this.releaseSkyLightEngine(skyEngine);
-            this.releaseBlockLightEngine(blockEngine);
+    /** Whole-nibble installs mark nothing; only per-block writes do. */
+    private void markChunkForRenderUpdate(final Chunk chunk) {
+        final int x0 = chunk.xPosition << 4;
+        final int z0 = chunk.zPosition << 4;
+        for (final ExtendedBlockStorage section : chunk.getBlockStorageArray()) {
+            if (section == null) continue;
+            final int y0 = section.getYLocation();
+            this.world.markBlockRangeForRenderUpdate(x0, y0, z0, x0 + 15, y0 + 15, z0 + 15);
         }
-        // Also queue to the async workers so that if a concurrent worker task overwrites our sync results with stale data,
-        // the workers will self-correct on a subsequent pass.
-        this.queueBlockChange(x, y, z);
-        this.scheduleUpdate();
     }
 
-    private void requeueChunkFromSync(final int cx, final int cz) {
-        final Chunk chunk = this.loadedChunkMap.get(CoordinateUtils.getChunkKey(cx, cz));
-        if (chunk == null) return;
-        final Boolean[] emptySections = SupernovaEngine.getEmptySectionsForChunk(chunk);
-        if (this.skyQueue != null) this.skyQueue.requeueChunkLight(cx, cz, chunk, emptySections, 0);
-        if (this.blockQueue != null) this.blockQueue.requeueChunkLight(cx, cz, chunk, emptySections, 0);
-        this.scheduleUpdate();
-    }
-
-    public boolean forceRelightChunk(final int cx, final int cz) {
-        final Chunk chunk = this.loadedChunkMap.get(CoordinateUtils.getChunkKey(cx, cz));
+    /** True when a retry now owns the lane, so the caller must not release it. */
+    private boolean requeueAfterFailure(final Lane lane, final ChunkTasks task, final int cx, final int cz) {
+        if (task.attempts >= MAX_RELIGHT_ATTEMPTS) {
+            Supernova.LOG.error("{} engine: chunk ({}, {}) failed {} times (BFS overflow or error) -- giving up.", lane.name, cx, cz, task.attempts + 1);
+            return false;
+        }
+        final Chunk chunk = this.loadedChunkMap.get(task.chunkCoordinate);
         if (chunk == null) return false;
-        ((SupernovaChunk) chunk).setLightReady(false);
-        final Boolean[] emptySections = SupernovaEngine.getEmptySectionsForChunk(chunk);
-        this.queueChunkLight(cx, cz, chunk, emptySections);
-        this.scheduleUpdate();
+        if (task.lightGeneration <= 0L || task.edgePass) {
+            // Neither holds a propagation lane; requeueing under an edge pass's generation consumes it and leaves the generation unpublished.
+            if (this.world.isRemote) {
+                Supernova.LOG.warn("{} engine: chunk ({}, {}) failed on the client -- keeping partial light, no relight.", lane.name, cx, cz);
+                return false;
+            }
+            relightAndResend(cx, cz, chunk);
+            return false;
+        }
+        lane.queue.requeueChunkLight(cx, cz, chunk, SupernovaEngine.getEmptySectionsForChunk(chunk), task.lightGeneration, task.attempts);
         return true;
     }
 
-    public void awaitPendingWork(final int cx, final int cz) {
-        // Check shared initial lighting completion
-        final ChunkLightCompletion completion;
-        synchronized (this.initialLightCompletions) {
-            completion = this.initialLightCompletions.get(CoordinateUtils.getChunkKey(cx, cz));
+    private boolean requeueEdgesAfterFailure(final Lane lane, final ChunkTasks task, final int cx, final int cz) {
+        if (task.lightGeneration <= 0L || !task.edgePass) return false;
+        if (task.attempts >= MAX_RELIGHT_ATTEMPTS) {
+            Supernova.LOG.error("{} engine: chunk ({}, {}) failed {} times (BFS overflow or error) -- publishing anyway.", lane.name, cx, cz,
+                task.attempts + 1);
+            return false;
         }
-        if (completion != null) {
+        lane.queue.queueInitialLightEdges(cx, cz, task.lightGeneration, task.attempts + 1);
+        return true;
+    }
+
+
+    public boolean forceRelightChunk(final int cx, final int cz) {
+        final long key = CoordinateUtils.getChunkKey(cx, cz);
+        final Chunk chunk = this.loadedChunkMap.get(key);
+        if (chunk == null) return false;
+        relightAndResend(cx, cz, chunk);
+        return true;
+    }
+
+    /** 1.7.10 has no light packet, so a relight is invisible without a full resend; packet construction must run on the server thread. */
+    private void relightAndResend(final int cx, final int cz, final Chunk chunk) {
+        final long key = CoordinateUtils.getChunkKey(cx, cz);
+        final InitialLightCoordinator.Generation generation = this.initialLighting.queue(cx, cz, chunk, SupernovaEngine.getEmptySectionsForChunk(chunk));
+        if (this.world.isRemote) return;
+        generation.done.addListener(() -> {
+            if (!generation.published) return;
             try {
-                completion.future.get(50, TimeUnit.MILLISECONDS);
+                ServerThreadUtil.addScheduledTask(() -> resendChunk(key));
+            } catch (final IllegalStateException stopping) {
+                // Server went away between the relight finishing and the resend being scheduled.
+            }
+        }, Runnable::run);
+    }
+
+    /** Short on purpose: timeout drops readiness, costing a relight instead of a partial save. */
+    public boolean awaitPendingWork(final int cx, final int cz) {
+        final long deadline = System.nanoTime() + UNLOAD_WAIT_NS;
+        while (true) {
+            final SettableFuture<Void> pending = pendingWorkFuture(cx, cz);
+            if (pending == null) return true;
+            final long remaining = deadline - System.nanoTime();
+            if (remaining <= 0L) break;
+            try {
+                pending.get(remaining, TimeUnit.NANOSECONDS);
+            } catch (final InterruptedException e) {
+                Thread.currentThread().interrupt();
+                return false;
             } catch (final Exception e) {
-                Supernova.LOG.warn("Timed out waiting for initial light work on chunk ({}, {})", cx, cz);
+                break;
+            }
+        }
+        Supernova.LOG.warn("Timed out waiting for light work on chunk ({}, {})", cx, cz);
+        return false;
+    }
+
+    private SettableFuture<Void> pendingWorkFuture(final int cx, final int cz) {
+        for (int dz = -1; dz <= 1; ++dz) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                final long key = CoordinateUtils.getChunkKey(cx + dx, cz + dz);
+                final SettableFuture<Void> pending = pendingWorkFutureAt(key);
+                if (pending != null) return pending;
+            }
+        }
+        return null;
+    }
+
+    private SettableFuture<Void> pendingWorkFutureAt(final long key) {
+        if (this.skyQueue != null) {
+            final SettableFuture<Void> f = this.skyQueue.pendingWorkFuture(key);
+            if (f != null) return f;
+        }
+        if (this.blockQueue != null) {
+            final SettableFuture<Void> f = this.blockQueue.pendingWorkFuture(key);
+            if (f != null) return f;
+        }
+        return this.initialLighting.pendingFuture(key);
+    }
+
+    private void resendChunk(final long key) {
+        if (!(this.world instanceof WorldServer)) return;
+        final Chunk chunk = this.loadedChunkMap.get(key);
+        if (chunk == null || !((SupernovaChunk) chunk).isLightReady()) return;
+        final S21PacketChunkData packet = new S21PacketChunkData(chunk, true, 0xFFFF);
+        for (final Object player : this.world.playerEntities) {
+            if (!(player instanceof EntityPlayerMP)) continue;
+            final EntityPlayerMP mp = (EntityPlayerMP) player;
+            if (((WorldServer) this.world).getPlayerManager().isPlayerWatchingChunk(mp, chunk.xPosition, chunk.zPosition)) {
+                mp.playerNetServerHandler.sendPacket(packet);
             }
         }
     }
@@ -560,22 +576,5 @@ public final class WorldLightManager {
             }
         }
         this.stats.close();
-    }
-
-    /**
-     * Coordination object for initial chunk lighting. Both sky and block workers decrement the countdown; the last one to finish sets lightReady and completes
-     * the future.
-     */
-    static final class ChunkLightCompletion {
-
-        final AtomicInteger remaining;
-        final SettableFuture<Void> future;
-        final Chunk chunk;
-
-        ChunkLightCompletion(final int engineCount, final Chunk chunk) {
-            this.remaining = new AtomicInteger(engineCount);
-            this.future = SettableFuture.create();
-            this.chunk = chunk;
-        }
     }
 }

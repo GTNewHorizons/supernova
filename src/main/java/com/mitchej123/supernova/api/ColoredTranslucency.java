@@ -1,7 +1,7 @@
 package com.mitchej123.supernova.api;
 
 /**
- * Interface for blocks with per-channel light absorption based on metadata alone. For position-dependent absorption, implement
+ * Interface for blocks with per-channel light transmission based on metadata alone. For position-dependent transmission, implement
  * {@link PositionalColoredTranslucency} instead. Build return values with {@link PackedColorLight#pack(int, int, int)}.
  *
  * @see TranslucencyRegistry

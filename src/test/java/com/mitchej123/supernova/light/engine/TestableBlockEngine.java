@@ -3,101 +3,131 @@ package com.mitchej123.supernova.light.engine;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.util.SnapshotChunkMap;
 import net.minecraft.world.World;
+import net.minecraft.world.chunk.Chunk;
 import net.minecraft.world.chunk.storage.ExtendedBlockStorage;
 
-import java.lang.reflect.Field;
+import java.util.ArrayList;
+import java.util.List;
 
-/**
- * Test subclass of SupernovaBlockEngine that exposes internals for cache population and assertions.
- */
-class TestableBlockEngine extends SupernovaBlockEngine {
+class TestableBlockEngine extends SupernovaBlockEngine implements RGBEngineAccess {
 
-    private static final Field NIBBLE_CACHE_R;
-    private static final Field NIBBLE_CACHE_G;
-    private static final Field NIBBLE_CACHE_B;
-
-    static {
-        try {
-            NIBBLE_CACHE_R = SupernovaRGBEngine.class.getDeclaredField("nibbleCacheR");
-            NIBBLE_CACHE_R.setAccessible(true);
-            NIBBLE_CACHE_G = SupernovaRGBEngine.class.getDeclaredField("nibbleCacheG");
-            NIBBLE_CACHE_G.setAccessible(true);
-            NIBBLE_CACHE_B = SupernovaRGBEngine.class.getDeclaredField("nibbleCacheB");
-            NIBBLE_CACHE_B.setAccessible(true);
-        } catch (NoSuchFieldException e) {
-            throw new RuntimeException(e);
-        }
-    }
+    private final List<Integer> renderMarks = new ArrayList<>();
 
     TestableBlockEngine(World world) {
         super(world, new SnapshotChunkMap());
-        this.suppressRenderNotify = true;
     }
 
-    SWMRNibbleArray[] getNibbleCacheR() {
-        try { return (SWMRNibbleArray[]) NIBBLE_CACHE_R.get(this); }
-        catch (IllegalAccessException e) { throw new RuntimeException(e); }
+    @Override
+    protected void markRenderSection(int originX, int originY, int originZ) {
+        this.renderMarks.add(originX);
+        this.renderMarks.add(originY);
+        this.renderMarks.add(originZ);
     }
 
-    SWMRNibbleArray[] getNibbleCacheG() {
-        try { return (SWMRNibbleArray[]) NIBBLE_CACHE_G.get(this); }
-        catch (IllegalAccessException e) { throw new RuntimeException(e); }
+    List<Integer> getRenderMarks() {
+        return this.renderMarks;
     }
 
-    SWMRNibbleArray[] getNibbleCacheB() {
-        try { return (SWMRNibbleArray[]) NIBBLE_CACHE_B.get(this); }
-        catch (IllegalAccessException e) { throw new RuntimeException(e); }
+    @Override
+    public SWMRNibbleArray[] getNibbleCacheR() {
+        return this.nibbleCacheR;
     }
 
-    ExtendedBlockStorage[] getSectionCache() {
+    @Override
+    public SWMRNibbleArray[] getNibbleCacheG() {
+        return this.nibbleCacheG;
+    }
+
+    @Override
+    public SWMRNibbleArray[] getNibbleCacheB() {
+        return this.nibbleCacheB;
+    }
+
+    @Override
+    public ExtendedBlockStorage[] getSectionCache() {
         return this.sectionCache;
     }
 
-    SWMRNibbleArray[] getNibbleCache() {
+    @Override
+    public SWMRNibbleArray[] getNibbleCache() {
         return this.nibbleCache;
     }
 
-    int getChunkSectionIndexOffset() {
+    boolean[] getNotifyUpdateCache() {
+        return this.notifyUpdateCache;
+    }
+
+    @Override
+    public int getChunkSectionIndexOffset() {
         return this.chunkSectionIndexOffset;
     }
 
-    int getCoordinateOffset() {
+    @Override
+    public int getCoordinateOffset() {
         return this.coordinateOffset;
     }
 
-    void callSetupEncodeOffset(int centerX, int centerY, int centerZ) {
+    @Override
+    public void callSetupEncodeOffset(int centerX, int centerY, int centerZ) {
         this.setupEncodeOffset(centerX, centerY, centerZ);
     }
 
-    void callPerformLightIncrease() {
+    void callPropagateNeighbourLevels(Chunk chunk, int fromSection, int toSection) {
+        this.propagateNeighbourLevels(chunk, fromSection, toSection);
+    }
+
+    void callCheckBlock(int worldX, int worldY, int worldZ) {
+        this.checkBlock(worldX, worldY, worldZ);
+    }
+
+    void callLightChunk(Chunk chunk, boolean needsEdgeChecks) {
+        this.lightChunk(chunk, needsEdgeChecks);
+    }
+
+    void putChunkInCache(int chunkX, int chunkZ, Chunk chunk) {
+        this.setChunkInCache(chunkX, chunkZ, chunk);
+    }
+
+    void callUpdateVisible() {
+        this.updateVisible();
+    }
+
+    int[] packSection(final int index) {
+        this.packSectionToCache(index);
+        return this.packedRGBCache[index];
+    }
+
+    void callCheckChunkEdge(final int chunkX, final int sectionY, final int chunkZ) {
+        this.checkChunkEdge(chunkX, sectionY, chunkZ);
+    }
+
+    @Override
+    public void callPerformLightIncrease() {
         this.performLightIncrease();
     }
 
-    void callPerformLightDecrease() {
+    @Override
+    public void callPerformLightDecrease() {
         this.performLightDecrease();
     }
 
-    void enqueueIncrease(long value) {
+    @Override
+    public void enqueueIncrease(long value) {
         this.appendToIncreaseQueue(value);
     }
 
-    void enqueueDecrease(long value) {
+    @Override
+    public void enqueueDecrease(long value) {
         this.appendToDecreaseQueue(value);
     }
 
-    int getIncreaseQueueLength() {
-        return this.increaseQueueInitialLength;
-    }
-
-    int getDecreaseQueueLength() {
-        return this.decreaseQueueInitialLength;
-    }
-
-    int getLightAt(int worldX, int worldY, int worldZ) {
+    @Override
+    public int getLightAt(int worldX, int worldY, int worldZ) {
         return this.getLightLevel(worldX, worldY, worldZ);
     }
 
-    void setLightAt(int worldX, int worldY, int worldZ, int packedRGB) {
+    @Override
+    public void setLightAt(int worldX, int worldY, int worldZ, int packedRGB) {
         this.setLightLevel(worldX, worldY, worldZ, packedRGB);
     }
 }

@@ -3,86 +3,92 @@ package com.mitchej123.supernova.compat.angelica;
 import com.gtnewhorizons.angelica.api.SectionLightData;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 
-/**
- * Wraps SWMR nibble array references (R, G, B for block and sky) as a {@link SectionLightData}. Snapshots visible byte[] refs and section flags at construction
- * for zero-volatile hot-path reads.
- */
+import java.util.Arrays;
+
+/** Fuses the six nibble planes into one array at construction, so a {@link SectionLightData} read touches no volatile and no SWMR state. */
 public class SupernovaSectionLightData implements SectionLightData {
 
-    /** Constant fused value for all-zero block + all-white sky sections. */
-    private static final long FUSED_ZERO_BLOCK_WHITE_SKY = 0xFFFL; // block=0, sky=0xFFF
+    /** Fused value for a section with zero block light and full white sky light. */
+    private static final long FUSED_ZERO_BLOCK_WHITE_SKY = 0xFFFL;
 
-    /**
-     * Precomputed fused (block | sky) values for all 4096 positions in the section. Entry layout: {@code ((block & 0xFFFF) << 16) | (sky & 0xFFFF)}. Null when
-     * allBlockZero && allSkyWhite (constant return).
-     */
-    private final long[] fusedCache;
+    private static final int SIZE = SWMRNibbleArray.ARRAY_SIZE;
 
-    public SupernovaSectionLightData(SWMRNibbleArray r, SWMRNibbleArray g, SWMRNibbleArray b, SWMRNibbleArray skyR, SWMRNibbleArray skyG, SWMRNibbleArray skyB) {
-        final byte[] rData = visibleData(r);
-        final byte[] gData = visibleData(g);
-        final byte[] bData = visibleData(b);
-        final byte[] skyRData = visibleData(skyR);
-        final byte[] skyGData = visibleData(skyG);
-        final byte[] skyBData = visibleData(skyB);
+    private static final byte[] ZERO_BYTES = new byte[SIZE];
+    private static final byte[] FULL_BYTES = new byte[SIZE];
 
-        final boolean allBlockZero = isNullOrZero(r) && isNullOrZero(g) && isNullOrZero(b);
-        final boolean allSkyWhite = isFull(skyR) && isFull(skyG) && isFull(skyB);
+    static {
+        Arrays.fill(FULL_BYTES, (byte) 0xFF);
+    }
 
-        if (allBlockZero && allSkyWhite) {
+    private static final ThreadLocal<byte[][]> SCRATCH = ThreadLocal.withInitial(() -> new byte[6][SIZE]);
+
+    /** Per position, {@code (block << 16) | sky}, each half a 12-bit RGB triple; null for a uniform dark-block/full-sky section. */
+    private final int[] fusedCache;
+
+    /** No block light, full daylight: the shape of every section above the terrain. */
+    public static final SupernovaSectionLightData ZERO_BLOCK_FULL_SKY = new SupernovaSectionLightData(null, null, null, null, null, null, true);
+
+    public SupernovaSectionLightData(SWMRNibbleArray r, SWMRNibbleArray g, SWMRNibbleArray b, SWMRNibbleArray skyR, SWMRNibbleArray skyG,
+        SWMRNibbleArray skyB, boolean hasSky) {
+        final byte[][] scratch = SCRATCH.get();
+        final byte[] rSrc = stateSource(snapshot(r, scratch[0]), scratch[0]);
+        final byte[] gSrc = stateSource(snapshot(g, scratch[1]), scratch[1]);
+        final byte[] bSrc = stateSource(snapshot(b, scratch[2]), scratch[2]);
+
+        // Absent sky R is daylight; absent G/B mirror R.
+        final int srState = snapshot(skyR, scratch[3]);
+        final byte[] srSrc = srState == SWMRNibbleArray.VISIBLE_ABSENT ? (hasSky ? FULL_BYTES : ZERO_BYTES) : stateSource(srState, scratch[3]);
+        final int sgState = snapshot(skyG, scratch[4]);
+        final byte[] sgSrc = sgState == SWMRNibbleArray.VISIBLE_ABSENT ? srSrc : stateSource(sgState, scratch[4]);
+        final int sbState = snapshot(skyB, scratch[5]);
+        final byte[] sbSrc = sbState == SWMRNibbleArray.VISIBLE_ABSENT ? srSrc : stateSource(sbState, scratch[5]);
+
+        if (rSrc == ZERO_BYTES && gSrc == ZERO_BYTES && bSrc == ZERO_BYTES && srSrc == FULL_BYTES && sgSrc == FULL_BYTES && sbSrc == FULL_BYTES) {
             this.fusedCache = null;
             return;
         }
 
-        final long[] cache = new long[4096];
-        for (int idx = 0; idx < 4096; idx++) {
-            final int block = allBlockZero ? 0 : (extractNibble(rData, idx) << 8) | (extractNibble(gData, idx) << 4) | extractNibble(bData, idx);
-            final int sky = allSkyWhite ? 0xFFF : (extractSkyNibble(skyRData, idx) << 8) | (extractSkyNibble(skyGData, idx) << 4) | extractSkyNibble(skyBData, idx);
-            cache[idx] = ((long) (block & 0xFFFF) << 16) | (sky & 0xFFFF);
+        final int[] cache = new int[4096];
+        for (int i = 0, idx = 0; i < SIZE; ++i, idx += 2) {
+            final int rb = rSrc[i], gb = gSrc[i], bb = bSrc[i];
+            final int srb = srSrc[i], sgb = sgSrc[i], sbb = sbSrc[i];
+            cache[idx] = ((rb & 0xF) << 24) | ((gb & 0xF) << 20) | ((bb & 0xF) << 16) | ((srb & 0xF) << 8) | ((sgb & 0xF) << 4) | (sbb & 0xF);
+            cache[idx + 1] = ((rb & 0xF0) << 20) | ((gb & 0xF0) << 16) | ((bb & 0xF0) << 12) | ((srb & 0xF0) << 4) | (sgb & 0xF0) | ((sbb & 0xF0) >>> 4);
         }
         this.fusedCache = cache;
     }
 
-    private static byte[] visibleData(SWMRNibbleArray nib) {
-        return nib == null ? null : nib.getVisibleData();
+    private static int snapshot(final SWMRNibbleArray nib, final byte[] dst) {
+        return nib == null ? SWMRNibbleArray.VISIBLE_ABSENT : nib.snapshotVisible(dst, 0);
     }
 
-    private static boolean isNullOrZero(SWMRNibbleArray nib) {
-        return nib == null || nib.isNullNibbleVisible() || nib.isZeroVisible();
-    }
-
-    private static boolean isFull(SWMRNibbleArray nib) {
-        return nib != null && !nib.isNullNibbleVisible() && nib.isFullVisible();
+    private static byte[] stateSource(final int state, final byte[] scratch) {
+        return switch (state) {
+            case SWMRNibbleArray.VISIBLE_DATA -> scratch;
+            case SWMRNibbleArray.VISIBLE_FULL -> FULL_BYTES;
+            default -> ZERO_BYTES;
+        };
     }
 
     @Override
     public int getRGB(int localX, int localY, int localZ) {
         if (fusedCache == null) return 0;
         final int idx = (localX & 15) | ((localZ & 15) << 4) | ((localY & 15) << 8);
-        return (int) (fusedCache[idx] >>> 16) & 0xFFF;
+        return (fusedCache[idx] >>> 16) & 0xFFF;
     }
 
     @Override
     public int getSkyRGB(int localX, int localY, int localZ) {
         if (fusedCache == null) return 0xFFF;
         final int idx = (localX & 15) | ((localZ & 15) << 4) | ((localY & 15) << 8);
-        return (int) fusedCache[idx] & 0xFFF;
+        return fusedCache[idx] & 0xFFF;
     }
 
+    /** Returns both 12-bit RGB triples as {@code (block << 16) | sky}. */
     @Override
     public long getRGBAndSkyRGB(int localX, int localY, int localZ) {
         if (fusedCache == null) return FUSED_ZERO_BLOCK_WHITE_SKY;
         final int idx = (localX & 15) | ((localZ & 15) << 4) | ((localY & 15) << 8);
         return fusedCache[idx];
-    }
-
-    private static int extractNibble(byte[] data, int idx) {
-        if (data == null) return 0;
-        return (data[idx >>> 1] >>> ((idx & 1) << 2)) & 0xF;
-    }
-
-    private static int extractSkyNibble(byte[] data, int idx) {
-        if (data == null) return 15;
-        return (data[idx >>> 1] >>> ((idx & 1) << 2)) & 0xF;
     }
 }

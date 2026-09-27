@@ -3,6 +3,7 @@ package com.mitchej123.supernova.compat.angelica;
 import com.gtnewhorizons.angelica.api.BlockLightProvider;
 import com.gtnewhorizons.angelica.api.SectionLightData;
 import com.gtnewhorizons.angelica.rendering.celeritas.world.WorldSlice;
+import com.mitchej123.supernova.light.ChunkLightHelper;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
 import com.mitchej123.supernova.light.SupernovaChunk;
 import com.mitchej123.supernova.util.WorldUtil;
@@ -10,9 +11,6 @@ import net.minecraft.world.IBlockAccess;
 import net.minecraft.world.World;
 import net.minecraft.world.chunk.Chunk;
 
-/**
- * Implements Angelica's {@link BlockLightProvider}
- */
 public class SupernovaBlockLightProvider implements BlockLightProvider {
 
     @Override
@@ -28,12 +26,16 @@ public class SupernovaBlockLightProvider implements BlockLightProvider {
         final SWMRNibbleArray g = getChannel(ext.getBlockNibblesG(), idx);
         final SWMRNibbleArray b = getChannel(ext.getBlockNibblesB(), idx);
 
-        final SWMRNibbleArray skyR = getSkyNibble(ext.getSkyNibblesR(), idx);
-        final SWMRNibbleArray skyG = getSkyNibble(ext.getSkyNibblesG(), idx);
-        final SWMRNibbleArray skyB = getSkyNibble(ext.getSkyNibblesB(), idx);
+        final SWMRNibbleArray skyR = getChannel(ext.getSkyNibblesR(), idx);
+        final SWMRNibbleArray skyG = getChannel(ext.getSkyNibblesG(), idx);
+        final SWMRNibbleArray skyB = getChannel(ext.getSkyNibblesB(), idx);
 
-        if (r == null && g == null && b == null && skyR == null && skyG == null && skyB == null) return null;
-        return new SupernovaSectionLightData(r, g, b, skyR, skyG, skyB);
+        final boolean hasSky = chunk.worldObj != null && !chunk.worldObj.provider.hasNoSky;
+        if (r == null && g == null && b == null && skyR == null && skyG == null && skyB == null) {
+            // An absent sky nibble is full daylight, not "no data": sections above the terrain carry no ExtendedBlockStorage and are never sent.
+            return hasSky ? SupernovaSectionLightData.ZERO_BLOCK_FULL_SKY : null;
+        }
+        return new SupernovaSectionLightData(r, g, b, skyR, skyG, skyB, hasSky);
     }
 
     @Override
@@ -44,23 +46,11 @@ public class SupernovaBlockLightProvider implements BlockLightProvider {
             return data.getRGB(x & 15, y & 15, z & 15);
         }
 
-        // Main-thread fallback via World
-        if (!(blockAccess instanceof World world)) return -1;
-
-        final int cx = x >> 4;
-        final int cz = z >> 4;
-        if (!world.getChunkProvider().chunkExists(cx, cz)) return -1;
-
-        final Chunk chunk = world.getChunkProvider().provideChunk(cx, cz);
-        if (chunk == null) return -1;
-
-        final int sectionY = y >> 4;
-        final int minLight = WorldUtil.getMinLightSection();
-        final int maxLight = WorldUtil.getMaxLightSection();
-        if (sectionY < minLight || sectionY > maxLight) return -1;
-
-        final SupernovaChunk ext = (SupernovaChunk) chunk;
-        final int idx = sectionY - minLight;
+        // Main-thread fallback: no WorldSlice off the render path.
+        final SupernovaChunk ext = resolveChunk(blockAccess, x, z);
+        if (ext == null) return -1;
+        final int idx = sectionIndex(y);
+        if (idx < 0) return -1;
 
         final int r = readNibble(ext.getBlockNibblesR(), idx, x, y, z);
         final int g = readNibble(ext.getBlockNibblesG(), idx, x, y, z);
@@ -77,58 +67,42 @@ public class SupernovaBlockLightProvider implements BlockLightProvider {
             return data.getSkyRGB(x & 15, y & 15, z & 15);
         }
 
-        if (!(blockAccess instanceof World world)) return -1;
+        final SupernovaChunk ext = resolveChunk(blockAccess, x, z);
+        if (ext == null) return -1;
+        final int idx = sectionIndex(y);
+        if (idx < 0) return -1;
 
-        final int cx = x >> 4;
-        final int cz = z >> 4;
-        if (!world.getChunkProvider().chunkExists(cx, cz)) return -1;
-
-        final Chunk chunk = world.getChunkProvider().provideChunk(cx, cz);
-        if (chunk == null) return -1;
-
-        final int sectionY = y >> 4;
-        final int minLight = WorldUtil.getMinLightSection();
-        final int maxLight = WorldUtil.getMaxLightSection();
-        if (sectionY < minLight || sectionY > maxLight) return -1;
-
-        final SupernovaChunk ext = (SupernovaChunk) chunk;
-        final int idx = sectionY - minLight;
-
-        final int r = readSkyNibble(ext.getSkyNibblesR(), idx, x, y, z);
-        final int g = readSkyNibble(ext.getSkyNibblesG(), idx, x, y, z);
-        final int b = readSkyNibble(ext.getSkyNibblesB(), idx, x, y, z);
+        final int r = ChunkLightHelper.readSkyChannel(ext.getSkyNibblesR(), idx, x, y, z, 15);
+        final int g = ChunkLightHelper.readSkyChannel(ext.getSkyNibblesG(), idx, x, y, z, r);
+        final int b = ChunkLightHelper.readSkyChannel(ext.getSkyNibblesB(), idx, x, y, z, r);
 
         return (r << 8) | (g << 4) | b;
     }
 
-    private static SWMRNibbleArray getChannel(SWMRNibbleArray[] nibbles, int idx) {
-        if (nibbles == null) return null;
-        if (idx < 0 || idx >= nibbles.length) return null;
-        final SWMRNibbleArray nib = nibbles[idx];
-        if (nib == null || nib.isNullNibbleVisible()) return null;
-        return nib;
+    private static SupernovaChunk resolveChunk(IBlockAccess blockAccess, int x, int z) {
+        if (!(blockAccess instanceof World world)) return null;
+        final int cx = x >> 4;
+        final int cz = z >> 4;
+        if (!world.getChunkProvider().chunkExists(cx, cz)) return null;
+        final Chunk chunk = world.getChunkProvider().provideChunk(cx, cz);
+        return chunk == null ? null : (SupernovaChunk) chunk;
     }
 
-    private static SWMRNibbleArray getSkyNibble(SWMRNibbleArray[] nibbles, int idx) {
-        if (nibbles == null) return null;
-        if (idx < 0 || idx >= nibbles.length) return null;
+    private static int sectionIndex(int y) {
+        final int sectionY = y >> 4;
+        final int minLight = WorldUtil.getMinLightSection();
+        final int maxLight = WorldUtil.getMaxLightSection();
+        return (sectionY < minLight || sectionY > maxLight) ? -1 : sectionY - minLight;
+    }
+
+    private static SWMRNibbleArray getChannel(SWMRNibbleArray[] nibbles, int idx) {
+        if (nibbles == null || idx < 0 || idx >= nibbles.length) return null;
         final SWMRNibbleArray nib = nibbles[idx];
-        if (nib == null || nib.isNullNibbleVisible()) return null;
-        return nib;
+        return ChunkLightHelper.nibbleAbsent(nib) ? null : nib;
     }
 
     private static int readNibble(SWMRNibbleArray[] nibbles, int idx, int x, int y, int z) {
-        if (nibbles == null) return 0;
-        final SWMRNibbleArray nib = nibbles[idx];
-        if (nib == null || nib.isNullNibbleVisible()) return 0;
-        return nib.getVisible(x, y, z);
-    }
-
-    private static int readSkyNibble(SWMRNibbleArray[] nibbles, int idx, int x, int y, int z) {
-        if (nibbles == null) return 15;
-        if (idx < 0 || idx >= nibbles.length) return 15;
-        final SWMRNibbleArray nib = nibbles[idx];
-        if (nib == null || nib.isNullNibbleVisible()) return 15;
-        return nib.getVisible(x, y, z);
+        final SWMRNibbleArray nib = getChannel(nibbles, idx);
+        return nib == null ? 0 : nib.getVisible(x, y, z);
     }
 }

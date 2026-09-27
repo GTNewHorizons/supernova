@@ -20,6 +20,11 @@ public final class SWMRNibbleArray {
 
     public static final int ARRAY_SIZE = 16 * 16 * 16 / 2; // 2048 bytes
 
+    public static final int VISIBLE_ABSENT = 0;
+    public static final int VISIBLE_ZERO = 1;
+    public static final int VISIBLE_FULL = 2;
+    public static final int VISIBLE_DATA = 3;
+
     static final ThreadLocal<ArrayDeque<byte[]>> WORKING_BYTES_POOL = ThreadLocal.withInitial(ArrayDeque::new);
 
     private static byte[] allocateBytes() {
@@ -52,15 +57,14 @@ public final class SWMRNibbleArray {
     private boolean updatingDirty;
     private volatile byte[] storageVisible;
 
-    // Dirty byte range tracking for efficient vanilla sync
     private int dirtyByteMin = ARRAY_SIZE;  // no dirty range
     private int dirtyByteMax = -1;
 
-    // Fast section state flags -- see isFullUpdating() / isZeroUpdating()
+    // Conservative: set only for known-uniform sections, cleared by any set().
     private boolean fullFlag;
     private boolean zeroFlag;
 
-    // Visible-side copies -- published by updateVisible(), read by render thread
+    // Published by updateVisible(), read by the render thread.
     private volatile boolean fullFlagVisible;
     private volatile boolean zeroFlagVisible;
 
@@ -78,7 +82,7 @@ public final class SWMRNibbleArray {
         }
         this.stateVisible = this.stateUpdating = bytes == null ? (isNullNibble ? INIT_STATE_NULL : INIT_STATE_UNINIT) : INIT_STATE_INIT;
         this.storageUpdating = this.storageVisible = bytes;
-        // bytes==null && !isNullNibble -> UNINIT -> reads as zero
+        // UNINIT (bytes == null, not a null nibble) reads as zero.
         this.zeroFlag = bytes == null && !isNullNibble;
         this.fullFlagVisible = this.fullFlag;
         this.zeroFlagVisible = this.zeroFlag;
@@ -101,20 +105,32 @@ public final class SWMRNibbleArray {
     public SaveState getSaveState() {
         synchronized (this) {
             final int state = this.stateVisible;
-            final byte[] data = this.storageVisible;
             if (state == INIT_STATE_NULL) {
                 return null;
             }
             if (state == INIT_STATE_UNINIT) {
                 return new SaveState(null, state);
             }
-            final boolean zero = isAllZero(data);
-            if (zero) {
+            if (darkVisibleLocked()) {
                 return state == INIT_STATE_INIT ? new SaveState(null, INIT_STATE_UNINIT) : null;
-            } else {
-                return new SaveState(data.clone(), state);
             }
+            return new SaveState(this.storageVisible.clone(), state);
         }
+    }
+
+    /** Exact test for "every visible value reads 0", unlike the conservative isZeroVisible() flag; a NULL nibble is absent, not dark, and reports false. */
+    public boolean isDarkVisible() {
+        synchronized (this) {
+            return this.stateVisible != INIT_STATE_NULL && darkVisibleLocked();
+        }
+    }
+
+    private boolean darkVisibleLocked() {
+        if (this.stateVisible == INIT_STATE_UNINIT) {
+            return true;
+        }
+        final byte[] data = this.storageVisible;
+        return data == null || isAllZero(data);
     }
 
     private static boolean isAllZero(final byte[] data) {
@@ -162,8 +178,7 @@ public final class SWMRNibbleArray {
         }
         this.dirtyByteMin = 0;
         this.dirtyByteMax = ARRAY_SIZE - 1;
-        // extrudeLower copies the y=0 row to all 16 rows.
-        // If the source is entirely uniform, the result is also uniform.
+        // A uniform source stays uniform once its y=0 row is copied over every row.
         this.fullFlag = other.fullFlag;
         this.zeroFlag = other.zeroFlag;
     }
@@ -272,6 +287,10 @@ public final class SWMRNibbleArray {
         return this.stateUpdating == INIT_STATE_HIDDEN;
     }
 
+    public boolean isInitialisedOrHiddenUpdating() {
+        return this.stateUpdating == INIT_STATE_INIT || this.stateUpdating == INIT_STATE_HIDDEN;
+    }
+
     public boolean isHiddenVisible() {
         return this.stateVisible == INIT_STATE_HIDDEN;
     }
@@ -341,11 +360,25 @@ public final class SWMRNibbleArray {
         }
     }
 
-    /**
-     * Return the raw backing byte array for the visible state. May be null if state is null or uninitialised.
-     */
+    /** Borrowed visible array, null for NULL/UNINIT; use {@link #snapshotVisible(byte[], int)} for a stable copy. */
     public byte[] getVisibleData() {
         return this.storageVisible;
+    }
+
+    /** Copies visible bytes when needed and returns a {@code VISIBLE_*} state under one lock. */
+    public synchronized int snapshotVisible(final byte[] dst, final int dstOffset) {
+        if (this.stateVisible == INIT_STATE_NULL) {
+            return VISIBLE_ABSENT;
+        }
+        final byte[] data = this.storageVisible;
+        if (data == null || this.zeroFlagVisible) {
+            return VISIBLE_ZERO;
+        }
+        if (this.fullFlagVisible) {
+            return VISIBLE_FULL;
+        }
+        System.arraycopy(data, 0, dst, dstOffset, ARRAY_SIZE);
+        return VISIBLE_DATA;
     }
 
     public int getUpdating(final int x, final int y, final int z) {
@@ -380,6 +413,15 @@ public final class SWMRNibbleArray {
 
     public byte[] getUpdatingStorage() {return this.storageUpdating;}
 
+    /** Skips a no-op write on an INIT or HIDDEN array; an UNINIT array is always written, since the first write promotes it to INIT. */
+    public boolean setChanged(final int index, final int value) {
+        if (this.isInitialisedOrHiddenUpdating() && this.getUpdating(index) == value) {
+            return false;
+        }
+        this.set(index, value);
+        return true;
+    }
+
     public void set(final int index, final int value) {
         if (this.fullFlag | this.zeroFlag) {
             this.fullFlag = false;
@@ -393,21 +435,6 @@ public final class SWMRNibbleArray {
         this.storageUpdating[i] = (byte) ((this.storageUpdating[i] & (0xF0 >>> shift)) | (value << shift));
         this.dirtyByteMin = Math.min(this.dirtyByteMin, i);
         this.dirtyByteMax = Math.max(this.dirtyByteMax, i);
-    }
-
-    /**
-     * Replace the entire backing array in storageUpdating with data from src. Marks dirty, clears full/zero flags. Caller is responsible for correct nibble
-     * packing.
-     */
-    public void bulkWriteAll(final byte[] src) {
-        if (!this.updatingDirty) {
-            this.swapUpdatingAndMarkDirty();
-        }
-        System.arraycopy(src, 0, this.storageUpdating, 0, ARRAY_SIZE);
-        this.dirtyByteMin = 0;
-        this.dirtyByteMax = ARRAY_SIZE - 1;
-        this.fullFlag = false;
-        this.zeroFlag = false;
     }
 
     /**
@@ -427,20 +454,6 @@ public final class SWMRNibbleArray {
         this.fullFlag = false;
         this.zeroFlag = false;
         return this.storageUpdating;
-    }
-
-    /**
-     * Mark the entire section dirty without writing data. Used after external code has written directly to the array returned by
-     * {@link #getUpdatingStorage()}.
-     */
-    public void markDirtyAll() {
-        if (!this.updatingDirty) {
-            this.swapUpdatingAndMarkDirty();
-        }
-        this.dirtyByteMin = 0;
-        this.dirtyByteMax = ARRAY_SIZE - 1;
-        this.fullFlag = false;
-        this.zeroFlag = false;
     }
 
     public int getDirtyByteMin() {return dirtyByteMin;}

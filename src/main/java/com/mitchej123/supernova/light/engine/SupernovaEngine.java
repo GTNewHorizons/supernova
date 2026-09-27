@@ -1,11 +1,13 @@
 package com.mitchej123.supernova.light.engine;
 
 import com.mitchej123.supernova.Supernova;
+import com.mitchej123.supernova.api.ExtendedSection;
 import com.mitchej123.supernova.api.ExtendedWorld;
+import com.mitchej123.supernova.api.FaceLightOcclusion;
 import com.mitchej123.supernova.compat.endlessids.EndlessIDsCompat;
 import com.mitchej123.supernova.light.LightStats;
-import com.mitchej123.supernova.light.RenderUpdateQueue;
 import com.mitchej123.supernova.light.SWMRNibbleArray;
+import com.mitchej123.supernova.light.SupernovaChunk;
 import com.mitchej123.supernova.util.WorldUtil;
 import it.unimi.dsi.fastutil.ints.IntIterator;
 import it.unimi.dsi.fastutil.ints.IntOpenHashSet;
@@ -68,19 +70,19 @@ public abstract class SupernovaEngine {
         }
     }
 
-    // index = x + (z * 5) + (y * 25), where x,z are [-2,2] offset from center chunk, y is light section
+    // index = x + (z * 5) + (y * 25); x,z are [-2,2] from the center chunk, y is a light section.
     protected final ExtendedBlockStorage[] sectionCache;
     protected final SWMRNibbleArray[] nibbleCache;
     protected final boolean[] notifyUpdateCache;
+    private final int maxNotifyY;
     protected final Chunk[] chunkCache = new Chunk[5 * 5];
+    private int modifiedChunkMask;
     protected final boolean[][] emptinessMapCache = new boolean[5 * 5][];
-    private int[] dirtyIndicesBuffer = new int[64];
 
     protected byte[][] blockB1Cache;          // [cacheSize] -> byte[4096] (block ID bits 0-7)
     protected NibbleArray[] blockB2LowCache;  // [cacheSize] -> NibbleArray (block ID bits 8-11)
-    protected int[] blockMaskCache;           // [cacheSize] -> eid$getBlockMask() (0=8bit, 1=12bit, ≥2=fallback)
+    protected int[] blockMaskCache;           // [cacheSize] -> eid$getBlockMask() (0=8bit, 1=12bit, >=2=fallback)
 
-    // Pool for int[4096] arrays -- avoids allocation churn during BFS
     protected static final ThreadLocal<ArrayDeque<int[]>> PACKED_ARRAY_POOL = ThreadLocal.withInitial(ArrayDeque::new);
 
     protected static int[] acquirePackedArray() {
@@ -109,20 +111,18 @@ public abstract class SupernovaEngine {
     protected final World world;
     protected LightStats stats;
 
-    // Diagnostic counters -- accumulated across propagateBlockChanges calls within one blocksChangedInChunk invocation.
+    // Accumulated across every propagateBlockChanges call in one blocksChangedInChunk.
     public int lastBfsIncreaseTotal;
     public int lastBfsDecreaseTotal;
     public int lastPositionsProcessed;
-    public boolean suppressRenderNotify;
-    public RenderUpdateQueue pendingRenderTarget;
+    /** Id of the block getBlockFast last returned; stale after any other engine call. */
+    protected int lastBlockId;
     protected final int minLightSection;
     protected final int maxLightSection;
     protected final int minSection;
     protected final int maxSection;
 
-    // Queue entry bit layout:
-    // [0..5] X (6 bits), [6..11] Z (6 bits), [12..27] Y (16 bits), [28..31] light level (4 bits),
-    // [32..37] direction bitset (6 bits), [61] FLAG_WRITE_LEVEL, [62] FLAG_RECHECK_LEVEL, [63] FLAG_HAS_SIDED_TRANSPARENT
+    // Queue entry: [0..5] X, [6..11] Z, [12..27] Y, [28..31] level, [32..37] direction bitset, [61] WRITE, [62] RECHECK, [63] SIDED_TRANSPARENT.
     protected static final int COORD_X_BITS = 6;
     protected static final int COORD_Z_BITS = 6;
     protected static final int COORD_Y_BITS = 16;
@@ -135,8 +135,34 @@ public abstract class SupernovaEngine {
         return (x + ((long) z << COORD_X_BITS) + ((long) y << (COORD_X_BITS + COORD_Z_BITS)) + encodeOffset) & COORD_MASK;
     }
 
-    protected static long sidedFlag(final Block block) {
-        return FaceOcclusion.hasSidedTransparency(block) ? FLAG_HAS_SIDED_TRANSPARENT_BLOCKS : 0L;
+    protected static long sidedFlag(final int blockId) {
+        return FaceOcclusion.hasSidedTransparency(blockId) ? FLAG_HAS_SIDED_TRANSPARENT_BLOCKS : 0L;
+    }
+
+    /** Face state of the BFS node being expanded; valid only until the next resolveSourceFaces call. */
+    protected long[] srcFaceBits;
+    protected int srcFaceMeta;
+    protected Block srcFaceBlock;
+
+    /** True when the source gates per face; the src fields are left stale on false, so callers must gate on the return. */
+    protected final boolean resolveSourceFaces(final long queueValue, final int posX, final int posY, final int posZ, final int sectionOffset) {
+        if ((queueValue & FLAG_HAS_SIDED_TRANSPARENT_BLOCKS) == 0L) return false;
+        final int srcIdx = (posX >> 4) + 5 * (posZ >> 4) + (5 * 5) * (posY >> 4) + sectionOffset;
+        final Block srcBlock = this.getBlockFast(srcIdx, posX & 15, posY & 15, posZ & 15);
+        if (srcBlock == Blocks.air) return false;
+        final long[] faceBits = FaceOcclusion.sidedFaceBits(this.lastBlockId);
+        if (faceBits == FaceOcclusion.NOT_SIDED) return false;
+        // Only an implementor legitimately has no table row; gating on a null row would report every face solid.
+        if (faceBits == null && !(srcBlock instanceof FaceLightOcclusion)) return false;
+        final ExtendedBlockStorage srcSection = this.sectionCache[srcIdx];
+        this.srcFaceMeta = srcSection != null ? srcSection.getExtBlockMetadata(posX & 15, posY & 15, posZ & 15) : 0;
+        this.srcFaceBits = faceBits;
+        this.srcFaceBlock = srcBlock;
+        return true;
+    }
+
+    protected final boolean isSourceFaceSolid(final int axisDir) {
+        return FaceOcclusion.isFaceSolid(this.srcFaceBits, this.srcFaceBlock, this.srcFaceMeta, axisDir);
     }
 
     public void setStats(final LightStats stats) {
@@ -157,6 +183,7 @@ public abstract class SupernovaEngine {
         this.sectionCache = new ExtendedBlockStorage[cacheSize];
         this.nibbleCache = new SWMRNibbleArray[cacheSize];
         this.notifyUpdateCache = new boolean[cacheSize];
+        this.maxNotifyY = totalLightSections - 1;
         this.blockB1Cache = new byte[cacheSize][];
         this.blockB2LowCache = new NibbleArray[cacheSize];
         this.blockMaskCache = new int[cacheSize];
@@ -174,7 +201,10 @@ public abstract class SupernovaEngine {
         this.chunkSectionIndexOffset = this.chunkIndexOffset + ((5 * 5) * this.chunkOffsetY);
     }
 
+    /** Overflow flags clear at entry, not teardown: callers read wasQueueOverflowed() after the call returns. */
     protected final void setupCaches(final int centerX, final int centerY, final int centerZ, final boolean relaxed, final boolean tryToLoadChunksFor2Radius) {
+        this.queueOverflowWarned = false;
+        this.queueOverflowed = false;
         final int centerChunkX = centerX >> 4;
         final int centerChunkZ = centerZ >> 4;
 
@@ -261,35 +291,47 @@ public abstract class SupernovaEngine {
     }
 
     protected final void updateVisible() {
-        this.expandDirtyNotifications();
+        this.beforeUpdateVisible();
         for (int index = 0, max = this.nibbleCache.length; index < max; ++index) {
             final SWMRNibbleArray nibble = this.nibbleCache[index];
             if (!this.notifyUpdateCache[index] && (nibble == null || !nibble.isDirty())) {
                 continue;
             }
+            if (nibble != null && nibble.isDirty()) {
+                this.markChunkModified(index);
+            }
             if (nibble != null) {
                 nibble.updateVisible();
             }
             this.onNibbleVisible(index, nibble);
-            if (this.notifyUpdateCache[index] && this.isClientSide) {
-                final int cxLocal = index % 5;
-                final int czLocal = (index / 5) % 5;
-                final int cyLocal = index / 25;
-                if (!this.suppressRenderNotify) {
-                    final int sectionX = (cxLocal - this.chunkOffsetX) << 4;
-                    final int sectionY = (cyLocal - this.chunkOffsetY) << 4;
-                    final int sectionZ = (czLocal - this.chunkOffsetZ) << 4;
-                    this.world.markBlockRangeForRenderUpdate(sectionX, sectionY, sectionZ, sectionX + 15, sectionY + 15, sectionZ + 15);
-                    LightStats.engineRenderMarks++;
-                } else if (this.pendingRenderTarget != null) {
-                    final int cx = cxLocal - this.chunkOffsetX;
-                    final int cz = czLocal - this.chunkOffsetZ;
-                    final int cy = cyLocal - this.chunkOffsetY;
-                    this.pendingRenderTarget.offer(((long) cx << 32) | ((long) (cz & 0xFFFF) << 16) | (cy & 0xFFFFL));
-                }
+            if (this.notifyUpdateCache[index]) {
+                this.markRenderSection((index % 5 - this.chunkOffsetX) << 4, (index / 25 - this.chunkOffsetY) << 4, ((index / 5) % 5 - this.chunkOffsetZ) << 4);
             }
         }
         this.updateVisibleExtra();
+        this.flushChunkModified();
+    }
+
+    /** Arguments are the section's world-space origin. */
+    protected void markRenderSection(final int originX, final int originY, final int originZ) {
+        this.world.markBlockRangeForRenderUpdate(originX, originY, originZ, originX + 15, originY + 15, originZ + 15);
+        LightStats.engineRenderMarks++;
+    }
+
+    /** Cache index modulo 25 is the 5x5 chunk grid, collapsing per-section marks to per-chunk. */
+    protected final void markChunkModified(final int sectionIndex) {
+        if (this.isClientSide) return;
+        this.modifiedChunkMask |= 1 << (sectionIndex % 25);
+    }
+
+    private void flushChunkModified() {
+        for (int mask = this.modifiedChunkMask; mask != 0; mask &= mask - 1) {
+            final Chunk owner = this.chunkCache[Integer.numberOfTrailingZeros(mask)];
+            if (owner != null) {
+                SupernovaChunk.markLightDirty(owner, this.skylightPropagator);
+            }
+        }
+        this.modifiedChunkMask = 0;
     }
 
     protected final void destroyCaches() {
@@ -303,8 +345,6 @@ public abstract class SupernovaEngine {
         if (this.isClientSide) {
             Arrays.fill(this.notifyUpdateCache, false);
         }
-        this.queueOverflowWarned = false;
-        this.queueOverflowed = false;
         this.destroyExtraCaches();
     }
 
@@ -313,30 +353,44 @@ public abstract class SupernovaEngine {
         return this.getBlockFast(sectionIndex, worldX & 15, worldY & 15, worldZ & 15);
     }
 
-    /**
-     * Inline block ID decode bypassing EndlessIDs dispatch. Falls back to getBlockByExtId when EID is not present or for rare 16/24-bit IDs.
-     */
+    /** Inline id decode bypassing EndlessIDs dispatch; publishes lastBlockId so callers needing both pay for one decode. */
     protected final Block getBlockFast(final int sectionIndex, final int x, final int y, final int z) {
-        final byte[] b1 = this.blockB1Cache[sectionIndex];
-        if (b1 == null) {
-            // No cached B1 -- either section is null or EID not present, fall back
-            final ExtendedBlockStorage section = this.sectionCache[sectionIndex];
-            return section != null ? section.getBlockByExtId(x, y, z) : Blocks.air;
+        final ExtendedBlockStorage section = this.sectionCache[sectionIndex];
+        // blockRefCount == 0 implies an all-zero id array; this only skips the decode.
+        if (section == null || ((ExtendedSection) section).supernova$hasNoBlocks()) {
+            this.lastBlockId = 0;
+            return Blocks.air;
         }
-        final int index = y << 8 | z << 4 | x;
-        int id = b1[index] & 0xFF;
+        final int id = this.decodeId(sectionIndex, x, y, z);
+        if (id >= 0) {
+            this.lastBlockId = id;
+            return Block.getBlockById(id);
+        }
+        final Block block = section.getBlockByExtId(x, y, z);
+        this.lastBlockId = Block.getIdFromBlock(block);
+        return block;
+    }
+
+    /** Never -1; falls back to the section's own lookup. */
+    protected final int getBlockIdFast(final int sectionIndex, final int x, final int y, final int z) {
+        final ExtendedBlockStorage section = this.sectionCache[sectionIndex];
+        if (section == null || ((ExtendedSection) section).supernova$hasNoBlocks()) return 0;
+        final int id = this.decodeId(sectionIndex, x, y, z);
+        return id >= 0 ? id : Block.getIdFromBlock(section.getBlockByExtId(x, y, z));
+    }
+
+    /** -1 when there is no B1 cache (EID absent) or for the rare 16/24-bit ids; callers fall back then. */
+    private int decodeId(final int sectionIndex, final int x, final int y, final int z) {
+        final byte[] b1 = this.blockB1Cache[sectionIndex];
+        if (b1 == null) return -1;
+        int id = b1[y << 8 | z << 4 | x] & 0xFF;
         final int mask = this.blockMaskCache[sectionIndex];
         if (mask >= 1) {
             final NibbleArray b2Low = this.blockB2LowCache[sectionIndex];
-            if (b2Low != null) {
-                id |= b2Low.get(x, y, z) << 8;
-            }
-            if (mask >= 2) {
-                // Rare: 16/24-bit IDs -- fall back to full EID path
-                return this.sectionCache[sectionIndex].getBlockByExtId(x, y, z);
-            }
+            if (b2Low != null) id |= b2Low.get(x, y, z) << 8;
+            if (mask >= 2) return -1;
         }
-        return Block.getBlockById(id);
+        return id;
     }
 
     protected final int getBlockMeta(final int worldX, final int worldY, final int worldZ) {
@@ -366,60 +420,42 @@ public abstract class SupernovaEngine {
         return level <= 1;
     }
 
-    protected void setLightLevel(final int worldX, final int worldY, final int worldZ, final int level) {
+    protected final void setLightLevel(final int worldX, final int worldY, final int worldZ, final int level) {
         final int sectionIndex = (worldX >> 4) + 5 * (worldZ >> 4) + (5 * 5) * (worldY >> 4) + this.chunkSectionIndexOffset;
+        final int localIndex = (worldX & 15) | ((worldZ & 15) << 4) | ((worldY & 15) << 8);
+        if (this.setLightLevelInCache(sectionIndex, localIndex, level)) this.postLightUpdate(sectionIndex, localIndex);
+    }
+
+    protected boolean setLightLevelInCache(final int sectionIndex, final int localIndex, final int level) {
         final SWMRNibbleArray nibble = this.nibbleCache[sectionIndex];
-        if (nibble != null) {
-            nibble.set((worldX & 15) | ((worldZ & 15) << 4) | ((worldY & 15) << 8), level);
-            this.postLightUpdate(sectionIndex);
-        }
+        return nibble != null && nibble.setChanged(localIndex, level);
     }
 
-    protected final void postLightUpdate(final int sectionIndex) {
-        if (this.isClientSide & (!this.suppressRenderNotify | this.pendingRenderTarget != null)) {
-            this.notifyUpdateCache[sectionIndex] = true;
-        }
-    }
-
-    /**
-     * Expand dirty notify flags to neighbouring sections. A light change near a section boundary affects rendering in the adjacent section, so we mark a 3x3x3
-     * neighbourhood around each dirty section. Called once in {@link #updateVisible()} before processing.
-     */
-    private void expandDirtyNotifications() {
-        final boolean[] cache = this.notifyUpdateCache;
-        final int len = cache.length;
-
-        // Collect dirty indices first to avoid cascading expansion
-        int dirtyCount = 0;
-        for (boolean dirty : cache) {
-            if (dirty) dirtyCount++;
-        }
-        if (dirtyCount == 0) return;
-
-        if (dirtyCount > this.dirtyIndicesBuffer.length) this.dirtyIndicesBuffer = new int[dirtyCount];
-        final int[] dirtyIndices = this.dirtyIndicesBuffer;
-        int idx = 0;
-        for (int i = 0; i < len; ++i) {
-            if (cache[i]) dirtyIndices[idx++] = i;
-        }
-
-        // Max sections per Y layer = 5*5 = 25, totalY = len/25
-        final int totalY = len / 25;
-        for (int d = 0; d < dirtyCount; ++d) {
-            final int index = dirtyIndices[d];
-            final int cx = index % 5;
-            final int cz = (index / 5) % 5;
-            final int cy = index / 25;
-            for (int dy = -1; dy <= 1; ++dy) {
-                final int ny = cy + dy;
-                if (ny < 0 || ny >= totalY) continue;
-                for (int dz = -1; dz <= 1; ++dz) {
-                    final int nz = cz + dz;
-                    if (nz < 0 || nz >= 5) continue;
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        final int nx = cx + dx;
-                        if (nx < 0 || nx >= 5) continue;
-                        cache[nx + 5 * nz + 25 * ny] = true;
+    /** Also marks neighbors across any section face the block sits on: smooth lighting samples one block across. */
+    protected final void postLightUpdate(final int sectionIndex, final int localIndex) {
+        if (this.isClientSide) {
+            final boolean[] cache = this.notifyUpdateCache;
+            final int lx = localIndex & 15;
+            final int ly = (localIndex >> 8) & 15;
+            final int lz = (localIndex >> 4) & 15;
+            // Interior (14^3 of 16^3): only this section can see the change.
+            if (((lx - 1) | (ly - 1) | (lz - 1) | (14 - lx) | (14 - ly) | (14 - lz)) >= 0) {
+                cache[sectionIndex] = true;
+                return;
+            }
+            final int cx = sectionIndex % 5;
+            final int cz = (sectionIndex / 5) % 5;
+            final int cy = sectionIndex / 25;
+            final int x1 = Math.max(lx == 0 ? cx - 1 : cx, 0);
+            final int x2 = Math.min(lx == 15 ? cx + 1 : cx, 4);
+            final int y1 = Math.max(ly == 0 ? cy - 1 : cy, 0);
+            final int y2 = Math.min(ly == 15 ? cy + 1 : cy, this.maxNotifyY);
+            final int z1 = Math.max(lz == 0 ? cz - 1 : cz, 0);
+            final int z2 = Math.min(lz == 15 ? cz + 1 : cz, 4);
+            for (int y = y1; y <= y2; ++y) {
+                for (int z = z1; z <= z2; ++z) {
+                    for (int x = x1; x <= x2; ++x) {
+                        cache[x + 5 * z + (5 * 5) * y] = true;
                     }
                 }
             }
@@ -439,7 +475,7 @@ public abstract class SupernovaEngine {
         final ExtendedBlockStorage[] sections = chunk.getBlockStorageArray();
         final Boolean[] ret = new Boolean[sections.length];
         for (int i = 0; i < sections.length; ++i) {
-            ret[i] = (sections[i] == null || sections[i].isEmpty()) ? Boolean.TRUE : Boolean.FALSE;
+            ret[i] = (sections[i] == null || ((ExtendedSection) sections[i]).supernova$hasNoBlocks()) ? Boolean.TRUE : Boolean.FALSE;
         }
         return ret;
     }
@@ -495,14 +531,13 @@ public abstract class SupernovaEngine {
             if (chunk == null) {
                 return;
             }
-            // 1. Section changes first (creates/removes nibbles)
+            // Sections first: they create and remove the nibbles the block pass writes into.
             if (changedSections != null) {
                 final boolean[] ret = this.handleEmptySectionChanges(chunk, changedSections, false);
                 if (ret != null) {
                     this.setEmptinessMap(chunk, ret);
                 }
             }
-            // 2. Block changes (uses now-updated nibbles)
             if (changedPositions != null && !changedPositions.isEmpty()) {
                 this.processBlockPositionChanges(chunk, chunkX, chunkZ, changedPositions);
             }
@@ -585,11 +620,7 @@ public abstract class SupernovaEngine {
 
     protected void prepareBatchedEdgeChecks(final int chunkX, final int chunkZ) {}
 
-    /**
-     * Process per-section emptiness changes.
-     * {@code emptinessChanges} is a tri-state {@code Boolean[]} where {@code null} means "no change" for that section
-     * index -- this sparse representation avoids recomputing unchanged sections.
-     */
+    /** emptinessChanges is tri-state: a null element means "no change" for that section, which is then never recomputed. */
     protected final boolean[] handleEmptySectionChanges(final Chunk chunk, final Boolean[] emptinessChanges, final boolean unlit) {
         final int chunkX = chunk.xPosition;
         final int chunkZ = chunk.zPosition;
@@ -601,7 +632,6 @@ public abstract class SupernovaEngine {
             this.setEmptinessMapCache(chunkX, chunkZ, ret = chunkEmptinessMap = new boolean[WorldUtil.getTotalSections()]);
         }
 
-        // update emptiness map
         for (int sectionIndex = (emptinessChanges.length - 1); sectionIndex >= 0; --sectionIndex) {
             Boolean valueBoxed = emptinessChanges[sectionIndex];
             if (valueBoxed == null) {
@@ -609,12 +639,11 @@ public abstract class SupernovaEngine {
                     continue;
                 }
                 final ExtendedBlockStorage section = this.getChunkSection(chunkX, sectionIndex + this.minSection, chunkZ);
-                emptinessChanges[sectionIndex] = valueBoxed = section == null || section.isEmpty() ? Boolean.TRUE : Boolean.FALSE;
+                emptinessChanges[sectionIndex] = valueBoxed = section == null || ((ExtendedSection) section).supernova$hasNoBlocks() ? Boolean.TRUE : Boolean.FALSE;
             }
             chunkEmptinessMap[sectionIndex] = valueBoxed;
         }
 
-        // init neighbour nibbles for non-empty sections
         for (int sectionIndex = (emptinessChanges.length - 1); sectionIndex >= 0; --sectionIndex) {
             final Boolean valueBoxed = emptinessChanges[sectionIndex];
             final int sectionY = sectionIndex + this.minSection;
@@ -631,7 +660,6 @@ public abstract class SupernovaEngine {
             }
         }
 
-        // check for de-init and lazy-init
         for (int dz = -1; dz <= 1; ++dz) {
             for (int dx = -1; dx <= 1; ++dx) {
                 boolean neighboursLoaded = true;
@@ -663,7 +691,7 @@ public abstract class SupernovaEngine {
                                     }
                                 } else {
                                     final ExtendedBlockStorage section = this.getChunkSection(dx + dx2 + chunkX, y, dz + dz2 + chunkZ);
-                                    if (section != null && !section.isEmpty()) {
+                                    if (section != null && !((ExtendedSection) section).supernova$hasNoBlocks()) {
                                         allEmpty = false;
                                         break neighbour_search;
                                     }
@@ -706,7 +734,6 @@ public abstract class SupernovaEngine {
             if (!currNibble.isInitialisedUpdating() && !neighbourNibble.isInitialisedUpdating()) {
                 continue;
             }
-            // Both sides identically full or both zero -- no edge correction needed
             if (this.areBothEdgeSectionsFull(currIdx, nIdx)) {
                 if (s != null) s.edgeSectionPairsSkippedFull.incrementAndGet();
                 continue;
@@ -748,13 +775,11 @@ public abstract class SupernovaEngine {
                     final int neighbourIndex = (neighbourX & 15) | ((neighbourZ & 15) << 4) | ((currY & 15) << 8);
                     final int neighbourLevel = this.getLightLevel(nIdx, neighbourIndex);
 
-                    // Both sides dark -- no emission or propagation possible
                     if (currentLevel == 0 && neighbourLevel == 0) {
                         blocksTrivial++;
                         continue;
                     }
-                    // Phase 2: consistency early-out -- if levels differ by at most 1 (min absorption)
-                    // and both are nonzero, neither side can be a better source across this edge
+                    // Within 1 (the minimum absorption): neither side can be a better source across this edge.
                     if (currentLevel > 0 && neighbourLevel > 0 && Math.abs(currentLevel - neighbourLevel) <= 1) {
                         blocksConsistency++;
                         continue;
@@ -856,9 +881,9 @@ public abstract class SupernovaEngine {
                             continue;
                         }
                         final int edgeIdx = (currX >> 4) + 5 * (currZ >> 4) + (5 * 5) * (currY >> 4) + this.chunkSectionIndexOffset;
-                        final Block edgeBlock = this.getBlockFast(edgeIdx, currX & 15, currY & 15, currZ & 15);
+                        final int edgeId = this.getBlockIdFast(edgeIdx, currX & 15, currY & 15, currZ & 15);
                         this.appendToIncreaseQueue(encodeCoords(currX, currZ, currY, encodeOffset) | this.encodeQueueLevel(level) | (propagateDirection
-                                << dirShift) | sidedFlag(edgeBlock));
+                                << dirShift) | sidedFlag(edgeId));
                     }
                 }
             }
@@ -872,7 +897,7 @@ public abstract class SupernovaEngine {
     protected static final int INITIAL_QUEUE_SIZE = 1 << 15; // 32768
     protected static final int MAX_QUEUE_SIZE = 1 << 20; // ~8MB per queue
 
-    /** Whether this light level is the maximum possible value (15 for scalar, WHITE for RGB sky). */
+    /** Maximum possible level: 15 for scalar, WHITE for RGB. */
     protected boolean isMaxLight(final int level) {return level == 15;}
 
     protected long[] increaseQueue = new long[INITIAL_QUEUE_SIZE];
@@ -955,11 +980,35 @@ public abstract class SupernovaEngine {
 
     protected void saveExtraLightNibbles(final Chunk chunk) {}
 
-    /**
-     * Called for each dirty nibble after its data is published but before the render update is triggered. Override to sync data to vanilla structures before
-     * Celeritas reads them.
-     */
-    protected void onNibbleVisible(final int cacheIndex, final SWMRNibbleArray nibble) {}
+    /** Scalar publish into vanilla's array; RGB engines override and publish via updateVisibleExtra. */
+    protected void onNibbleVisible(final int cacheIndex, final SWMRNibbleArray nibble) {
+        if (nibble == null) return;
+        final int sectionY = cacheIndex / 25 - this.chunkOffsetY;
+        if (sectionY < this.minSection || sectionY > this.maxSection) return;
+        final ExtendedBlockStorage section = this.sectionCache[cacheIndex];
+        if (section == null) return;
+        final byte[] src = nibble.getVisibleData();
+        final NibbleArray vanilla = this.skylightPropagator ? section.getSkylightArray() : section.getBlocklightArray();
+        if (vanilla == null) return;
+        synchronized (section) {
+            if (src == null) {
+                Arrays.fill(vanilla.data, (byte) (this.skylightPropagator && nibble.isNullNibbleVisible() ? 0xFF : 0));
+            } else {
+                System.arraycopy(src, 0, vanilla.data, 0, src.length);
+            }
+            final int trivial = this.skylightPropagator ? 0xFF : 0;
+            boolean nonTrivial = false;
+            for (final byte value : vanilla.data) {
+                if ((value & 0xFF) != trivial) {
+                    nonTrivial = true;
+                    break;
+                }
+            }
+            ((ExtendedSection) section).supernova$setLightNonTrivial(this.skylightPropagator, nonTrivial);
+        }
+    }
+
+    protected void beforeUpdateVisible() {}
 
     protected void updateVisibleExtra() {}
 

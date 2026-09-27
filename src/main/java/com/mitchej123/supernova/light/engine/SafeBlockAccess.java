@@ -1,5 +1,6 @@
 package com.mitchej123.supernova.light.engine;
 
+import com.mitchej123.supernova.util.CoordinateUtils;
 import com.mitchej123.supernova.util.SnapshotChunkMap;
 import net.minecraft.block.Block;
 import net.minecraft.init.Blocks;
@@ -24,7 +25,7 @@ public final class SafeBlockAccess implements IBlockAccess {
     }
 
     private Chunk getChunk(final int cx, final int cz) {
-        return this.chunkMap.get(((long) cx << 32) | (cz & 0xFFFFFFFFL));
+        return this.chunkMap.get(CoordinateUtils.getChunkKey(cx, cz));
     }
 
     @Override

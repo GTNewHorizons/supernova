@@ -8,11 +8,11 @@ import com.mitchej123.supernova.light.WorldLightManager;
  */
 public interface SupernovaWorld extends ExtendedWorld {
 
+    /** Latched by supernova$shutdown: at most one manager per World object for its lifetime, and null forever after. */
     WorldLightManager supernova$getLightManager();
 
+    /** The field without the lazy construction: a chunk save after supernova$shutdown must not resurrect the manager and its worker threads. */
+    WorldLightManager supernova$lightManagerIfPresent();
+
     void supernova$shutdown();
-
-    void supernova$setPlayerAction(boolean value);
-
-    boolean supernova$isPlayerAction();
 }

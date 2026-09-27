@@ -9,6 +9,7 @@ import net.minecraft.block.Block;
 /**
  * Miscellaneous mod light colors that don't warrant their own file.
  */
+/** Mods with too few entries to warrant their own file. */
 public final class MiscColors {
 
     public static void register() {
@@ -141,6 +142,10 @@ public final class MiscColors {
         // kekztech
         count += ColorRegistrationHelper.registerBlock("kekztech", "kekztech_ichorjar_block", LightColors.DIM_GRAY);
         count += ColorRegistrationHelper.registerBlock("kekztech", "kekztech_thaumiumreinforcedjar_block", LightColors.DIM_GRAY);
+
+        // Meta 1 = activated; the positional getLightValue is meta > 0 ? 15 : 0, so a static meta-1 entry is exact.
+        count += ColorRegistrationHelper.registerBlock("EnderIO", "blockElectricLight", 1, LightColors.DYE_WHITE);
+        count += ColorRegistrationHelper.registerBlock("EnderIO", "blockLightNode", 1, LightColors.DYE_WHITE);
 
         if (count > 0) {
             Supernova.LOG.info("Registered {} misc mod light colors", count);

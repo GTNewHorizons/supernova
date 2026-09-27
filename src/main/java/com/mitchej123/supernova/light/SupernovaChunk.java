@@ -7,9 +7,28 @@ import com.mitchej123.supernova.api.ExtendedChunk;
  */
 public interface SupernovaChunk extends ExtendedChunk {
 
-    /** Sync Supernova SWMR visible data -> vanilla nibble arrays so chunk packets carry correct values. */
+    /** Copies SWMR visible data into the vanilla nibbles so chunk packets carry correct values. */
     void syncLightToVanilla();
     void setLightReady(boolean ready);
+    void setLightUsable(boolean usable);
+
+    /** Light changed since the last successful save. Owned by Supernova because vanilla's isModified is read-then-cleared by the save loop. */
+    void markLightDirty(boolean sky);
+
+    void clearLightDirty(boolean sky);
+
+    static void markLightDirty(final net.minecraft.world.chunk.Chunk chunk, final boolean sky) {
+        if (chunk instanceof SupernovaChunk) {
+            ((SupernovaChunk) chunk).markLightDirty(sky);
+        } else {
+            chunk.setChunkModified();
+        }
+    }
+
+    static void markLightDirty(final net.minecraft.world.chunk.Chunk chunk) {
+        markLightDirty(chunk, false);
+        markLightDirty(chunk, true);
+    }
 
     // Sky light
     SWMRNibbleArray[] getSkyNibbles();

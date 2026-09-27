@@ -30,7 +30,7 @@ public final class DefaultColors {
         LightColorRegistry.register(Blocks.powered_repeater, 6, 1, 1);
     }
 
-    /** Register modded defaults. Call in postInit after all mods have registered blocks. */
+    /** Call in postInit, after every mod has registered its blocks. */
     public static void registerModded() {
         ModCompat.registerAll();
     }
