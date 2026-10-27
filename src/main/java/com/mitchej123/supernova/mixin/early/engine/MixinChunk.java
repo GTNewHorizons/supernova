@@ -254,7 +254,7 @@ public abstract class MixinChunk implements SupernovaChunk {
      * @reason Supernova handles skylight column updates via updateLightByType
      */
     @Overwrite
-    private void relightBlock(int x, int y, int z) {
+    public void relightBlock(int x, int y, int z) {
         final int heightMapIdx = z << 4 | x;
         final int currentHeight = this.heightMap[heightMapIdx];
         int newHeight = Math.max(y + 1, currentHeight);
